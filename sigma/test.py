@@ -16,3 +16,5 @@ y = model.apply(params,x)
 print(f'Inputs: {x} \n Outputs: {y}')
 print(f'Inputs shape : {x.shape} \n Outputs shape {y.shape}')
 
+cart_x = spherical_to_cartesian(x)
+print(f'Cartesian x, {cart_x} with shape {cart_x.shape}')

@@ -45,8 +45,6 @@ def spherical_to_cartesian(angles: jnp.ndarray) -> jnp.ndarray:
 
 def cartesian_to_spherical(vectors: jnp.ndarray) -> jnp.ndarray:
     vectors = jnp.asarray(vectors)
-    if vectors.shape[-1] != 3:
-        raise ValueError(f"Expected shape (N,3), got {vectors.shape}")
 
     x = vectors[:, 0]
     y = vectors[:, 1]
