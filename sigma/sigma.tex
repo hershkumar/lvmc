@@ -1,0 +1,90 @@
+% arara: pdflatex: { shell : yes }
+% % arara: bibtex
+% arara: pdflatex if found('log', 'undefined references')
+
+
+\documentclass{notes}
+
+\usepackage{amsmath}
+\usepackage{mathtools}
+\usepackage{braket}
+\usepackage{tcolorbox}
+\usepackage{amssymb}
+\usepackage{amsthm}
+\usepackage{listings}
+\usepackage{xcolor}
+\usepackage{bm}
+\usepackage{esint}
+\usepackage{gensymb}
+\usepackage{mathrsfs}
+
+\usepackage{slashed}
+\usepackage{simpler-wick}
+\usepackage{tikz}
+\usepackage{tikz-feynman}
+\usepackage{tikz-feynhand}
+
+\definecolor{codegreen}{rgb}{0,0.6,0}
+\definecolor{codegray}{rgb}{0.5,0.5,0.5}
+\definecolor{codepurple}{rgb}{0.58,0,0.82}
+\definecolor{backcolour}{rgb}{0.95,0.95,0.92}
+
+\lstdefinestyle{mystyle}{
+    backgroundcolor=\color{backcolour},   
+    commentstyle=\color{codegreen},
+    keywordstyle=\color{magenta},
+    numberstyle=\tiny\color{codegray},
+    stringstyle=\color{codepurple},
+    basicstyle=\ttfamily\footnotesize,
+    breakatwhitespace=false,         
+    breaklines=true,                 
+    captionpos=b,                    
+    keepspaces=true,                 
+    numbers=left,                    
+    numbersep=5pt,                  
+    showspaces=false,                
+    showstringspaces=false,
+    showtabs=false,                  
+    tabsize=2
+}
+
+\lstset{style=mystyle}
+
+
+\newtheorem{postulate}{Postulate}
+\newtheorem{theorem}{Theorem}[section]
+\newtheorem{corollary}{corollary}[section]
+\newtheorem{lemma}[theorem]{Lemma}
+
+\title{Sigma Model Lattice VMC}
+\date{}
+
+\let\ve\varepsilon
+\let\vec\bm
+\begin{document}
+\maketitle
+
+The 1D $\sigma$ model Hamiltonian is given by:
+ \begin{align*}
+	 \hat{H} &=  \eta g^2 \sum_{i=0}^N  \vec{L}^2_i + \frac{\eta}{g^2}\sum_{i=0}^N \hat{n}_i \cdot \hat{n}_{i+1}
+\end{align*}
+Where $\hat n_i$ is parameterized by two angles,  $\rho_i$ and  $\phi_i$.
+We define our ansatz as:
+\begin{align*}
+	\psi\left(\{\rho_i, \phi_i\}\right) &=  e^{-\text{NN}\left(\{\rho_i, \phi_i\}\right)}
+\end{align*}
+
+We define the energy in the usual VMC way:
+\begin{align*}
+	\mathcal{E} &=  \left\langle \frac{H\psi}{\psi}\right\rangle_{\psi^2}
+\end{align*}
+And the gradient in the usual way:
+\begin{align*}
+\frac{\partial \mathcal{E}}{\partial \theta} &=  2 \left\langle \frac{\partial \ln\psi}{\partial \theta} \frac{H\psi}{\psi}\right\rangle - \left\langle \frac{\partial
+\ln\psi}{\partial \theta} \right\rangle \left\langle \frac{H\psi}{\psi} \right\rangle
+\end{align*}
+
+
+
+
+\end{document}
