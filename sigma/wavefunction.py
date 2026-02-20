@@ -8,7 +8,7 @@ from typing import Sequence, Callable, Optional
 """
 Feedfoward network for outputting psi(U) given field configuration U in spherical basis
 """
-class psi(nn.Module):
+class MLP(nn.Module):
     hidden_sizes: Sequence[int] = (128, 128)
     activation: Callable = nn.celu
 
@@ -22,7 +22,7 @@ class psi(nn.Module):
             x = self.activation(x)
 
         y = nn.Dense(1)(x)
-        return jnp.exp(-jnp.squeeze(y, axis=-1))
+        return jnp.squeeze(y, axis=-1)
 
 
 """
