@@ -60,18 +60,13 @@ class Sampler:
         pos_initial = project_angles(jnp.asarray(pos_initial))
         NS = Nsweeps * keep + Ntherm
 
-        # Allow scalar or (2,) stepsize
-        stepsize = jnp.asarray(stepsize)
-        stepsize = jnp.where(stepsize.shape == (), jnp.array([stepsize, stepsize]), stepsize)
-        stepsize_theta, stepsize_phi = stepsize[0], stepsize[1]
-
         key = random.PRNGKey(seed)
         key, k1, k2 = random.split(key, 3)
 
         # Proposals: uniform increments, but separate scales for theta/phi
         # randoms: (NS, N, 2)
         raw = random.uniform(k1, shape=(NS,) + self.shape, minval=-1.0, maxval=1.0)
-        dx = raw.at[..., 0].multiply(stepsize_theta).at[..., 1].multiply(stepsize_phi)
+        dx = raw.at[..., 0].multiply(stepsize).at[..., 1].multiply(stepsize)
 
         limits = random.uniform(k2, shape=(NS,))
 
