@@ -8,6 +8,8 @@ from typing import Sequence, Callable, Optional
 """
 Feedfoward network for outputting psi(U) given field configuration U in spherical basis
 """
+
+
 class MLP(nn.Module):
     hidden_sizes: Sequence[int] = (128, 128)
     activation: Callable = nn.celu
@@ -29,6 +31,7 @@ class MLP(nn.Module):
 Helper functions to convert field configurations between spherical and cartesian
 """
 
+
 def spherical_to_cartesian(angles: jnp.ndarray) -> jnp.ndarray:
     angles = jnp.asarray(angles)
 
@@ -42,6 +45,7 @@ def spherical_to_cartesian(angles: jnp.ndarray) -> jnp.ndarray:
     z = jnp.cos(theta)
 
     return jnp.stack([x, y, z], axis=-1)
+
 
 def cartesian_to_spherical(vectors: jnp.ndarray) -> jnp.ndarray:
     vectors = jnp.asarray(vectors)

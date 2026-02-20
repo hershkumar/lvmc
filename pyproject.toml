@@ -13,3 +13,8 @@ dependencies = [
     "optax>=0.2.7",
     "plotly>=6.5.2",
 ]
+
+[dependency-groups]
+dev = [
+    "black>=26.1.0",
+]
