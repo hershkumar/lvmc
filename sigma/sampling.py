@@ -7,116 +7,126 @@ TWOPI = 2.0 * jnp.pi
 
 
 def wrap_phi(phi):
-    # Map to [0, 2π)
     return jnp.mod(phi, TWOPI)
 
 
 def reflect_theta(theta):
-    """
-    Reflect to [0, π] in a way that preserves symmetry.
-    Equivalent to reflecting on boundaries repeatedly.
-    """
-    # First fold into [0, 2π)
     t = jnp.mod(theta, TWOPI)
-    # Then reflect [π, 2π) back into [0, π]
     return jnp.where(t <= jnp.pi, t, TWOPI - t)
 
 
 def project_angles(coords):
-    """
-    coords: (..., N, 2) with coords[..., 0]=theta, coords[..., 1]=phi
-    returns projected coords in correct domains.
-    """
     theta = reflect_theta(coords[..., 0])
     phi = wrap_phi(coords[..., 1])
-    return coords.at[..., 0].set(theta).at[..., 1].set(phi)
+    return jnp.stack([theta, phi], axis=-1)
 
 
 class Sampler:
     def __init__(self, psi, shape):
-        """
-        psi(params, coords) -> scalar amplitude for a single configuration.
-        shape: (N, 2), sampling N sites and each site has 2 angles.
-        First angle is polar angle theta in [0, pi],
-        second is azimuthal angle phi in [0, 2*pi).
-        """
         self.psi = psi
         self.shape = tuple(shape)
         self.N = self.shape[0]
-        if self.shape[1] != 2:
-            raise ValueError(f"Expected shape (N,2) for (theta,phi), got {self.shape}")
 
-    @partial(jax.jit, static_argnums=(0,))
-    def log_psi(self, coords, params):
-        return jnp.log(self.psi(params, coords) + 1e-300)
-
-    @partial(jax.jit, static_argnums=(0, 2, 3, 4, 5))
+    # Only Nsweeps/Ntherm/keep are static because they determine shapes/loop lengths.
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
     def run_chain(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initial, seed):
-        """
-        stepsize:
-          - scalar: used for both theta and phi
-          - or array-like shape (2,): [stepsize_theta, stepsize_phi]
+        pos = project_angles(jnp.asarray(pos_initial))
+        stepsize = jnp.asarray(stepsize)
 
-        Returns:
-          samples: (Nsweeps, *self.shape)  e.g. (Nsweeps, N, 2)
-          acc_rate: scalar
-        """
-        pos_initial = project_angles(jnp.asarray(pos_initial))
         NS = Nsweeps * keep + Ntherm
-
         key = random.PRNGKey(seed)
-        key, k1, k2 = random.split(key, 3)
 
-        # Proposals: uniform increments, but separate scales for theta/phi
-        # randoms: (NS, N, 2)
-        raw = random.uniform(k1, shape=(NS,) + self.shape, minval=-1.0, maxval=1.0)
-        dx = raw.at[..., 0].multiply(stepsize).at[..., 1].multiply(stepsize)
+        # Inline log(psi) to avoid nested-jit boundary.
+        # Add tiny epsilon so log is well-defined if psi can be 0.
+        def log_psi(coords):
+            return jnp.log(self.psi(params, coords) + 1e-300)
 
-        limits = random.uniform(k2, shape=(NS,))
+        log_pos = log_psi(pos)
+        acc0 = jnp.array(0, dtype=jnp.int32)
 
-        # Store chain: (NS+1, N, 2)
-        sq = (
-            jnp.zeros((NS + 1,) + self.shape, dtype=pos_initial.dtype)
-            .at[0]
-            .set(pos_initial)
+        # -----------------------
+        # Thermalization (step-wise)
+        # -----------------------
+        # Thermalization is typically smaller; step-wise split is usually fine.
+        def therm_step(carry, _):
+            pos, log_pos, key, acc = carry
+            key, k_dx, k_u = random.split(key, 3)
+
+            dx = random.uniform(k_dx, shape=self.shape, minval=-1.0, maxval=1.0) * stepsize
+            proposed = project_angles(pos + dx)
+
+            log_new = log_psi(proposed)
+            log_ratio = 2.0 * (log_new - log_pos)
+
+            u = random.uniform(k_u, shape=())
+            accept = jnp.log(u) <= log_ratio
+
+            pos2 = lax.select(accept, proposed, pos)
+            log_pos2 = lax.select(accept, log_new, log_pos)
+            acc2 = acc + accept.astype(acc.dtype)
+            return (pos2, log_pos2, key, acc2), None
+
+        (pos, log_pos, key, acc_therm), _ = lax.scan(
+            therm_step,
+            (pos, log_pos, key, acc0),
+            xs=None,
+            length=Ntherm,
         )
-        counter = jnp.array(0, dtype=jnp.int32)
 
-        def one_step(i, vals):
-            sq, counter = vals
-            old = sq[i]  # (N,2)
-            proposed = old + dx[i]
+        # -----------------------
+        # Sampling (batched RNG per sweep)
+        # -----------------------
+        # For each sweep, generate all `keep` proposals + uniforms at once, then scan.
+        def sweep_step(carry, _):
+            pos, log_pos, key, acc = carry
+            key, k_dx, k_u = random.split(key, 3)
 
-            # Enforce domains: theta in [0,π], phi in [0,2π)
-            new = project_angles(proposed)
+            dx_batch = random.uniform(
+                k_dx, shape=(keep,) + self.shape, minval=-1.0, maxval=1.0
+            ) * stepsize
+            u_batch = random.uniform(k_u, shape=(keep,))
 
-            # MH acceptance: exp(2*(log|psi(new)| - log|psi(old)|))
-            log_ratio = 2.0 * (self.log_psi(new, params) - self.log_psi(old, params))
-            prob = jnp.exp(log_ratio)
+            def inner(carry2, inputs):
+                pos_i, log_pos_i, acc_i = carry2
+                dx_i, u_i = inputs
 
-            accept = prob >= limits[i]  # scalar bool
+                proposed = project_angles(pos_i + dx_i)
+                log_new = log_psi(proposed)
+                log_ratio = 2.0 * (log_new - log_pos_i)
 
-            sq = sq.at[i + 1].set(lax.select(accept, new, old))
-            counter = counter + accept.astype(counter.dtype)
-            return sq, counter
+                accept = jnp.log(u_i) <= 2.0 * (log_new - log_pos_i)
 
-        sq, counter = lax.fori_loop(0, NS, one_step, (sq, counter))
+                pos_o = lax.select(accept, proposed, pos_i)
+                log_pos_o = lax.select(accept, log_new, log_pos_i)
+                acc_o = acc_i + accept.astype(acc_i.dtype)
+                return (pos_o, log_pos_o, acc_o), None
 
-        samples = sq[1 + Ntherm :: keep]
-        acc_rate = counter.astype(jnp.float32) / jnp.asarray(NS, dtype=jnp.float32)
+            (pos2, log_pos2, acc2), _ = lax.scan(
+                inner,
+                (pos, log_pos, acc),
+                (dx_batch, u_batch),
+            )
+
+            return (pos2, log_pos2, key, acc2), pos2  # store after sweep
+
+        (pos_f, log_pos_f, key_f, acc_sample), samples = lax.scan(
+            sweep_step,
+            (pos, log_pos, key, acc0),
+            xs=None,
+            length=Nsweeps,
+        )
+
+        total_acc = acc_therm + acc_sample
+        acc_rate = total_acc.astype(jnp.float32) / jnp.asarray(NS, dtype=jnp.float32)
         return samples, acc_rate
 
-    @partial(jax.jit, static_argnums=(0, 2, 3, 4, 5))
-    def run_many_chains(
-        self, params, Nsweeps, Ntherm, keep, stepsize, pos_initials, seeds
-    ):
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
+    def run_many_chains(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initials, seeds):
         pos_initials = project_angles(jnp.asarray(pos_initials))
         seeds = jnp.asarray(seeds)
 
         chain_vmapped = jax.vmap(
-            lambda pos0, sd: self.run_chain(
-                params, Nsweeps, Ntherm, keep, stepsize, pos0, sd
-            ),
+            lambda pos0, sd: self.run_chain(params, Nsweeps, Ntherm, keep, stepsize, pos0, sd),
             in_axes=(0, 0),
             out_axes=(0, 0),
         )
