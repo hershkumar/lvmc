@@ -27,14 +27,13 @@ class MLP(nn.Module):
         return jnp.squeeze(y, axis=-1)
 
 
-
-
 class TI_CNN(nn.Module):
     """1D translation-invariant CNN with 2 features per lattice site (periodic BCs).
 
     Expected input shape: (..., L, 2)
     Output shape: (...)   (scalar per leading batch-like index)
     """
+
     conv_features: Sequence[int] = (64, 64, 64)
     mlp_hidden_sizes: Sequence[int] = (128, 128)
     activation: Callable = nn.celu
@@ -69,7 +68,9 @@ class TI_CNN(nn.Module):
         elif self.pool == "max":
             x = jnp.max(x, axis=lattice_axis)
         else:
-            raise ValueError(f"Unknown pool='{self.pool}' (use 'mean', 'sum', or 'max').")
+            raise ValueError(
+                f"Unknown pool='{self.pool}' (use 'mean', 'sum', or 'max')."
+            )
 
         # MLP head.
         for h in self.mlp_hidden_sizes:
