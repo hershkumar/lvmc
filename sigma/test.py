@@ -26,7 +26,24 @@ cart_x = spherical_to_cartesian(x)
 print(f'Cartesian x, {cart_x} with shape {cart_x.shape}')
 
 
+#===========
+# testing CNN translation invariance
+def test_CNN():
+    N = 5
+    x = np.random.normal(size=(N,2))
+    model = TI_CNN()
+    params = model.init(jax.random.PRNGKey(0), x)
+    y = model.apply(params,x)
 
+    print(f'Inputs: {x} \n Outputs: {y}')
+    print(f'Inputs shape : {x.shape} \n Outputs shape {y.shape}')
+    test_config = x
+    print(f'Original config output: {model.apply(params, test_config)}')
+    for shift in range(1, N):
+        shifted_config = jnp.roll(test_config, shift=shift, axis=0)
+        print(f'Shifted config (shift={shift}) output: {model.apply(params, shifted_config)}')
+
+test_CNN()
 
 
 #=================
