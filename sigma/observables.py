@@ -78,14 +78,6 @@ def config_energy(model, eta, g, params, config):
 
     return kinetic_term + potential_term
 
-@partial(jit, static_argnums=(0,1))
-def batch_config_energy(model, eta, g, params, configs):
-    """
-    Computes the energy of many configurations at once.
-    """
-    raise NotImplementedError("Energy observable not implemented yet.")
-
-
 @partial(jit, static_argnums=(0,))
 def dlogpsi_dparams(model, params, config):
     """
@@ -103,12 +95,23 @@ def dlogpsi_dparams(model, params, config):
     # d logpsi / d params = - dA / d params
     return jax.tree_util.tree_map(lambda x: -x, gradA)
 
-def gradient(model, eta, g, params, config):
+def local_terms(model, eta, g, params, config):
     """
     Computes the gradient of the energy with respect to the parameters.
     """
 
     local_energy = config_energy(model, eta, g, params, config)
-    dlogpsi_dparams = dlogpsi_dparams(model, params, config)
+    dlogpsi_dparams = dlogpsi_dparams(model, params, config)    
 
-    return [local_energy, dlogpsi_dparams, pytree_mult(local_energy,dlogpsi_dparams)]
+
+    return [local_energy, dlogpsi_dparams, pytree_mult(local_energy, dlogpsi_dparams)]
+
+def dE_dparams(model, eta, g, params, configs):
+    energies, logs, mults = jax.vmap(lambda config: local_terms(model, eta, g, params, config), in_axes=0)(configs)
+    energy = jnp.mean(energies)
+    uncert = jnp.std(energies) / jnp.sqrt(energies.shape[0])
+
+    # grad = 2 * mean(mults) - 2 * mean(energies) * mean(logs) 
+    grad = pytree_add(pytree_mult(2, pytree_mean(mults)),-pytree_mult(2*energy, pytree_mean(logs)))
+
+    return grad, energy, uncert

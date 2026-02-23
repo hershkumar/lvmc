@@ -1,5 +1,6 @@
 from optax import adam, chain, scale, scale_by_adam
 from jax import numpy as jnp
+from observables import dE_dparams
 from tqdm import trange
 
 # =============
