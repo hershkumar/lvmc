@@ -66,3 +66,15 @@ samples, acc_rate = sampler.run_many_chains(
 print(f"Acceptance rate: {acc_rate}")
 print(samples.shape)
 # =================
+
+
+# =============================
+# Testing observables
+random_sample = np.random.normal(size=(N,2))
+
+energy = config_energy(model, 1.0, 1.0, params, random_sample)
+print(energy)
+grad = dlogpsi_dparams(model, params, random_sample)
+
+
+
