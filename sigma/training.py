@@ -48,7 +48,7 @@ def train(init_params, model, couplings, sampler, MC_options, steps, lr, fig=Non
     opt_state = tx.init(init_params)
 
     params = init_params
-    
+
     avg_energies = []
     avg_uncerts = []
 
@@ -75,9 +75,18 @@ def step(params, model, couplings, sampler, MC_options):
     Performs a single training step: samples configurations, computes the loss, and updates the model parameters.
     """
     # sample configurations using the sampler
-    samples, _ = sampler.run_many_chains(params, MC_options["num_samples"]//MC_options["nchains"], MC_options["thermalization"], MC_options["skip"], MC_options["var"], MC_options["pos_initials"], MC_options["seeds"])
+    samples, _ = sampler.run_many_chains(
+        params,
+        MC_options["num_samples"] // MC_options["nchains"],
+        MC_options["thermalization"],
+        MC_options["skip"],
+        MC_options["var"],
+        MC_options["pos_initials"],
+        MC_options["seeds"],
+    )
 
     return dE_dparams(model, couplings, params, samples)
+
 
 # =============
 # Stochastic Reconfiguration Methods
