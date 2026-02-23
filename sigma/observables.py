@@ -145,3 +145,14 @@ def dE_dparams(model, eta, g, params, configs):
     grad = pytree_add(pytree_mult(2, pytree_mean(mults)),pytree_mult(-2*energy, pytree_mean(logs)))
 
     return grad, energy, uncert
+
+@jit
+def nx_n0(configs):
+
+    def nx_n0_single(config):
+        n0 = config[0]
+        return jnp.sum(config * n0[None,:], axis=-1)
+
+    C = jax.vmap(nx_n0_single)(configs)
+    return jnp.mean(C, axis=0)
+
