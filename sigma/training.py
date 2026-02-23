@@ -24,7 +24,7 @@ example_MC_options = {
 }
 
 
-def train(init_params, model, couplings, sampler, MC_options, steps, lr, fig=None):
+def train(init_params, model, eta, g, sampler, MC_options, steps, lr, fig=None):
     """
     Args:
         init_params: Initial parameters of the model.
@@ -53,16 +53,22 @@ def train(init_params, model, couplings, sampler, MC_options, steps, lr, fig=Non
     avg_uncerts = []
 
     # loop over training steps
-    for step in trange(steps):
+    for step_num in trange(steps):
 
-        grads, energy, uncert = step(params, model, couplings, sampler, MC_options)
+        grads, energy, uncert = step(params, model, eta, g, sampler, MC_options)
         avg_energies.append(energy)
         avg_uncerts.append(uncert)
 
         if fig is not None:
-            fig.update_traces(x=[step], y=[energy], selector={"name": "Energy"})
-            fig.update_traces(x=[step], y=[uncert], selector={"name": "Uncertainty"})
+            fig.data[0].x = step_num
+            fig.data[0].y = energy
 
+            fig.data[1].x = step_num
+            fig.data[1].y = energy + uncert
+
+            fig.data[2].x = step_num
+            fig.data[2].y = energy - uncert
+        
         updates, opt_state = tx.update(grads, opt_state)
 
         params = tx.apply_updates(params, updates)
@@ -70,7 +76,7 @@ def train(init_params, model, couplings, sampler, MC_options, steps, lr, fig=Non
     return params, avg_energies, avg_uncerts
 
 
-def step(params, model, couplings, sampler, MC_options):
+def step(params, model, eta, g, sampler, MC_options):
     """
     Performs a single training step: samples configurations, computes the loss, and updates the model parameters.
     """
@@ -85,7 +91,7 @@ def step(params, model, couplings, sampler, MC_options):
         MC_options["seeds"],
     )
 
-    return dE_dparams(model, couplings, params, samples)
+    return dE_dparams(model, eta, g, params, samples)
 
 
 # =============
