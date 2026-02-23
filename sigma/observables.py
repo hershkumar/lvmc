@@ -103,7 +103,7 @@ def dlogpsi_dparams(model, params, config):
     # d logpsi / d params = - dA / d params
     return jax.tree_util.tree_map(lambda x: -x, gradA)
 
-def gradient(model, eta, g, params, configs):
+def gradient(model, eta, g, params, config):
     """
     Computes the gradient of the energy with respect to the parameters.
     """
