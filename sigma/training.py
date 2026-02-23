@@ -76,13 +76,17 @@ def train(init_params, model, eta, g, sampler, MC_options, steps, lr, fig=None):
 
 
     # loop over training steps
-    for step_num in trange(steps):
+
+    pbar = trange(steps, desc="", leave=True)
+    for step_num in pbar:
 
         grads, energy, uncert = step(params, model, eta, g, sampler, MC_options)
         # print(energy)
         # print(grads)
         avg_energies.append(energy)
         avg_uncerts.append(uncert)
+        # set the label of the tqdm bar to print the current energy
+        pbar.set_description(f"Energy = {energy}", refresh=True)
 
         if fig is not None:
             push_point(fig, step_num, energy, uncert)
