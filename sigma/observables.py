@@ -112,6 +112,6 @@ def dE_dparams(model, eta, g, params, configs):
     uncert = jnp.std(energies) / jnp.sqrt(energies.shape[0])
 
     # grad = 2 * mean(mults) - 2 * mean(energies) * mean(logs) 
-    grad = pytree_add(pytree_mult(2, pytree_mean(mults)),-pytree_mult(2*energy, pytree_mean(logs)))
+    grad = pytree_add(pytree_mult(2, pytree_mean(mults)),pytree_mult(-2*energy, pytree_mean(logs)))
 
     return grad, energy, uncert

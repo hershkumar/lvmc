@@ -1,4 +1,4 @@
-from optax import adam, chain, scale, scale_by_adam
+import optax
 from jax import numpy as jnp
 from observables import dE_dparams
 from tqdm import trange
@@ -42,39 +42,59 @@ def train(init_params, model, eta, g, sampler, MC_options, steps, lr, fig=None):
         uncert: List of uncertainties at each training step.
     """
 
-    tx = chain(
-        scale_by_adam(),
-        scale(-lr),
-    )
-    opt_state = tx.init(init_params)
 
     params = init_params
-
+    tx = optax.adam(lr)
+    opt_state = tx.init(params)
+    step_nums = []
     avg_energies = []
     avg_uncerts = []
+
+    def push_point(fig, step, e, s):
+        step_nums.append(step)
+        avg_energies.append(e)
+        avg_uncerts.append(s)
+
+        steps_arr = jnp.asarray(step_nums)
+        E_arr = jnp.asarray(avg_energies)
+        sig_arr = jnp.asarray(avg_uncerts)
+
+        upper = E_arr + sig_arr
+        lower = E_arr - sig_arr
+
+        # Batch-update to reduce redraw flicker
+        with fig.batch_update():
+            fig.data[0].x = steps_arr
+            fig.data[0].y = E_arr
+
+            fig.data[1].x = steps_arr
+            fig.data[1].y = upper
+
+            fig.data[2].x = steps_arr
+            fig.data[2].y = lower
+
+
 
     # loop over training steps
     for step_num in trange(steps):
 
         grads, energy, uncert = step(params, model, eta, g, sampler, MC_options)
+        # print(energy)
+        # print(grads)
         avg_energies.append(energy)
         avg_uncerts.append(uncert)
 
         if fig is not None:
-            fig.data[0].x = step_num
-            fig.data[0].y = energy
+            push_point(fig, step_num, energy, uncert)
 
-            fig.data[1].x = step_num
-            fig.data[1].y = energy + uncert
+        updates, opt_state = tx.update(grads, opt_state, params)
 
-            fig.data[2].x = step_num
-            fig.data[2].y = energy - uncert
-        
-        updates, opt_state = tx.update(grads, opt_state)
-
-        params = tx.apply_updates(params, updates)
+        params = optax.apply_updates(params, updates)
 
     return params, avg_energies, avg_uncerts
+
+
+
 
 
 def step(params, model, eta, g, sampler, MC_options):

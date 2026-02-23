@@ -92,7 +92,6 @@ class Sampler:
 
                 proposed = project_angles(pos_i + dx_i)
                 log_new = log_psi(proposed)
-                log_ratio = 2.0 * (log_new - log_pos_i)
 
                 accept = jnp.log(u_i) <= 2.0 * (log_new - log_pos_i)
 
