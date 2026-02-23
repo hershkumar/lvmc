@@ -62,6 +62,9 @@ def step(params, model, sampler, MC_options):
     """
     Performs a single training step: samples configurations, computes the loss, and updates the model parameters.
     """
+    # sample configurations using the sampler
+    # compute the gradient
+    # update the parameters using the optimizer
     raise NotImplementedError(
         "This is a placeholder for the training step. We will implement this later."
     )
