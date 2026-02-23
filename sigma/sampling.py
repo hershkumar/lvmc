@@ -39,7 +39,7 @@ class Sampler:
         # Inline log(psi) to avoid nested-jit boundary.
         # Add tiny epsilon so log is well-defined if psi can be 0.
         def log_psi(coords):
-            return jnp.log(self.psi(params, coords) + 1e-300)
+            return jnp.log(jnp.abs(self.psi(params, coords)) + 1e-300)
 
         log_pos = log_psi(pos)
         acc0 = jnp.array(0, dtype=jnp.int32)
