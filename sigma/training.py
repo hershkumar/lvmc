@@ -1,4 +1,4 @@
-from optax import adam
+from optax import adam, chain, scale, scale_by_adam
 from jax import numpy as jnp
 from tqdm import trange
 
@@ -24,7 +24,7 @@ example_MC_options = {
 }
 
 
-def train(init_params, model, sampler, MC_options, steps, lr, ):
+def train(init_params, model, couplings, sampler, MC_options, steps, lr, fig=None):
     """
     Args:
         init_params: Initial parameters of the model.
@@ -33,42 +33,51 @@ def train(init_params, model, sampler, MC_options, steps, lr, ):
         MC_options: Monte Carlo options for sampling.
         steps: Number of training steps.
         lr: Learning rate for optimization.
+        fig: optional argument, a plotly figure widget to update with training progress (energy and uncertainty). If None, no plotting is done.
+
+    Returns:
+        params: The optimized parameters after training.
+        energies: List of average energies at each training step.
+        uncert: List of uncertainties at each training step.
     """
-    # unpack the MC options
-    num_samples = MC_options["num_samples"]
-    thermalization = MC_options["thermalization"]
-    skip = MC_options["skip"]
-    var = MC_options["var"]
-    nchains = MC_options["nchains"]
-    seeds = MC_options["seeds"]
-    pos_initials = MC_options["pos_initials"]
+
+    tx = chain(
+        scale_by_adam(),
+        scale(-lr),
+    )
+    opt_state = tx.init(init_params)
 
     params = init_params
+    
+    avg_energies = []
+    avg_uncerts = []
+
     # loop over training steps
     for step in trange(steps):
 
-        # call the step function
+        grads, energy, uncert = step(params, model, couplings, sampler, MC_options)
+        avg_energies.append(energy)
+        avg_uncerts.append(uncert)
 
-        # update the progress bar with the current energy
+        if fig is not None:
+            fig.update_traces(x=[step], y=[energy], selector={"name": "Energy"})
+            fig.update_traces(x=[step], y=[uncert], selector={"name": "Uncertainty"})
+
+        updates, opt_state = tx.update(grads, opt_state)
+
+        params = tx.apply_updates(params, updates)
+
+    return params, avg_energies, avg_uncerts
 
 
-        continue 
-    raise NotImplementedError(
-        "This is a placeholder for the training loop. We will implement this later."
-    )
-
-
-def step(params, model, sampler, MC_options):
+def step(params, model, couplings, sampler, MC_options):
     """
     Performs a single training step: samples configurations, computes the loss, and updates the model parameters.
     """
     # sample configurations using the sampler
-    # compute the gradient
-    # update the parameters using the optimizer
-    raise NotImplementedError(
-        "This is a placeholder for the training step. We will implement this later."
-    )
+    samples, _ = sampler.run_many_chains(params, MC_options["num_samples"]//MC_options["nchains"], MC_options["thermalization"], MC_options["skip"], MC_options["var"], MC_options["pos_initials"], MC_options["seeds"])
 
+    return dE_dparams(model, couplings, params, samples)
 
 # =============
 # Stochastic Reconfiguration Methods
