@@ -101,10 +101,10 @@ def local_terms(model, eta, g, params, config):
     """
 
     local_energy = config_energy(model, eta, g, params, config)
-    dlogpsi_dparams = dlogpsi_dparams(model, params, config)    
+    lg = dlogpsi_dparams(model, params, config)    
 
 
-    return [local_energy, dlogpsi_dparams, pytree_mult(local_energy, dlogpsi_dparams)]
+    return [local_energy, lg, pytree_mult(local_energy, lg)]
 
 def dE_dparams(model, eta, g, params, configs):
     energies, logs, mults = jax.vmap(lambda config: local_terms(model, eta, g, params, config), in_axes=0)(configs)
