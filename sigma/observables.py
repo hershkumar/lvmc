@@ -5,38 +5,54 @@ import jax.numpy as jnp
 from jax import jit
 import jax
 
-@partial(jit, static_argnums=(0))
-def spherical_laplacian(model, params, config):
-    """
-    Returns sum of spherical laplacian per site i.e the angular momentum per site squared 
-    """
-    N = config.shape[0]
-    v_local = jax.vmap(lambda i : local_L2_per_site(model, params, config, i), in_axes=0)
 
-    return jnp.sum(v_local(jnp.arange(N)))
-
-
-def local_L2_per_site(model, params, config, site_i):
+def cartesian_to_angles(n, eps=1e-8):
     """
-    Returns (L_i^2 psi)/psi at site_i, assuming:
-      model.apply(params, config) = A(config) = -log psi(config)
-    so psi = exp(-A).
+    n: (L,3) unit vectors (approximately)
+    returns angles: (L,2) = (theta, phi)
     """
-    config = jnp.asarray(config)
-    eps=1e-8
-    def A_of_site(a_i):
-        new_config = config.at[site_i].set(a_i)
-        return model.apply(params, new_config)  # A = -logψ (possibly complex)
+    n = jnp.asarray(n)
+    x, y, z = n[:, 0], n[:, 1], n[:, 2]
 
-    a0 = config[site_i]  # (theta, phi)
+    zc = jnp.clip(z, -1.0 + eps, 1.0 - eps)
+    theta = jnp.arccos(zc)
+
+    phi = jnp.arctan2(y, x)  # in (-pi, pi]
+    # Map to [0, 2pi) if you prefer:
+    # phi = jnp.mod(phi, 2.0*jnp.pi)
+
+    return jnp.stack([theta, phi], axis=-1)
+
+
+def local_L2_per_site_cartesian(model, params, config_xyz, site_i, eps=1e-8):
+    """
+    Computes (L_i^2 psi)/psi at site_i, where:
+      - config_xyz is (L,3) of unit vectors n_i
+      - model.apply(params, config_xyz) returns A = model = -log psi
+      - psi = exp(-A)
+
+    Implementation:
+      - convert config_xyz -> angles (theta, phi)
+      - compute Δ_{S^2} A and |∇A|^2 in angular coordinates
+      - return (L^2 psi)/psi = ΔA - |∇A|^2
+    """
+    config_xyz = jnp.asarray(config_xyz)
+    ang = cartesian_to_angles(config_xyz, eps=eps)  # (L,2)
+
+    def A_of_site(ang_i):
+        ang2 = ang.at[site_i].set(ang_i)
+        xyz2 = angles_to_unitvec(ang2)  # re-embed onto S^2
+        return model.apply(params, xyz2)
+
+    a0 = ang[site_i]  # (theta, phi)
 
     g = jax.grad(A_of_site)(a0)        # (A_theta, A_phi)
-    H = jax.hessian(A_of_site)(a0)     # [[A_tt, A_tφ],[A_φt, A_φφ]]
+    H = jax.hessian(A_of_site)(a0)     # [[A_tt, ...],[..., A_pp]]
 
     theta = a0[0]
     sin_t = jnp.sin(theta)
     sin_t = jnp.where(jnp.abs(sin_t) < eps, jnp.sign(sin_t) * eps + (sin_t == 0) * eps, sin_t)
-    sin2  = sin_t * sin_t
+    sin2 = sin_t * sin_t
     cot_t = jnp.cos(theta) / sin_t
 
     A_t, A_p = g[0], g[1]
@@ -46,35 +62,49 @@ def local_L2_per_site(model, params, config, site_i):
     lap_A = A_tt + cot_t * A_t + A_pp / sin2
     gradA_sq = (A_t * A_t) + (A_p * A_p) / sin2  # no complex conjugation
 
-    # (L^2 ψ)/ψ = ΔA - |∇A|^2  (with S^2 metric)
     return lap_A - gradA_sq
 
 
-def angles_to_unitvec(config):
+@partial(jit, static_argnums=(0,))
+def spherical_laplacian_cartesian(model, params, config_xyz):
     """
-    config: (L, 2) with columns (theta, phi)
-    returns n: (L, 3)
+    Returns sum_i (L_i^2 psi)/psi over sites i, with config in Cartesian.
     """
-    theta = config[:, 0]
-    phi = config[:, 1]
-    st = jnp.sin(theta)
-    return jnp.stack(
-        [st * jnp.cos(phi), st * jnp.sin(phi), jnp.cos(theta)],
-        axis=-1,
+    L = config_xyz.shape[0]
+    vals = jax.vmap(lambda i: local_L2_per_site_cartesian(model, params, config_xyz, i))(
+        jnp.arange(L)
     )
+    return jnp.sum(vals)
 
 
-@partial(jit, static_argnums=(0,1))
-def config_energy(model, eta, g, params, config):
+def angles_to_unitvec(config_ang):
     """
-    Computes the energy of a single configuration.
+    config_ang: (L,2) with columns (theta, phi)
+    returns n: (L,3)
     """
-    kinetic_term = eta*g**2 * spherical_laplacian(model, params, config)
+    theta = config_ang[:, 0]
+    phi = config_ang[:, 1]
+    st = jnp.sin(theta)
+    return jnp.stack([st * jnp.cos(phi), st * jnp.sin(phi), jnp.cos(theta)], axis=-1)
 
-    n = angles_to_unitvec(config)
-    n_next = jnp.roll(n, shift=-1, axis=0)
-    nn = jnp.sum(n*n_next, axis=-1)
-    potential_term = -(eta/g**2.)*jnp.sum(nn)
+
+@partial(jit, static_argnums=(0,))
+def config_energy(model, eta, g, params, config_xyz):
+    """
+    Local energy for config in Cartesian (L,3), PBCs on the neighbor dot-product term.
+
+    Assumes Hamiltonian of the same form you used:
+      kinetic:   eta * g^2 * sum_i (L_i^2 psi)/psi
+      potential: -(eta/g^2) * sum_i n_i · n_{i+1}   (PBC)
+
+    Adjust prefactors/signs if your convention differs.
+    """
+    kinetic_term = eta * (g**2) * spherical_laplacian_cartesian(model, params, config_xyz)
+
+    n = jnp.asarray(config_xyz)
+    n_next = jnp.roll(n, shift=-1, axis=0)  # PBC
+    nn = jnp.sum(n * n_next, axis=-1)
+    potential_term = -(eta / (g**2)) * jnp.sum(nn)
 
     return kinetic_term + potential_term
 
