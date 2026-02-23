@@ -27,6 +27,33 @@ class MLP(nn.Module):
         return jnp.squeeze(y, axis=-1)
 
 
+class MLP_TI(nn.Module):
+    hidden_sizes: Sequence[int] = (128, 128)
+    activation: Callable = nn.celu
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x)
+
+        # x is typically (..., N, 2); flatten to (..., L) where L=N*2
+        x = x.reshape(*x.shape[:-2], -1)
+        L = x.shape[-1]
+
+        # First layer enforcing the image equation:
+        # y_i = | sum_{k=1}^L x_k e^{2π i k / L} |  (DFT magnitude; sign convention doesn't matter for |.|)
+        # This produces y_i for i=0..L-1.
+        x = jnp.abs(jnp.fft.fft(x, axis=-1))
+
+        # Standard MLP on top
+        for h in self.hidden_sizes:
+            x = nn.Dense(h)(x)
+            x = self.activation(x)
+
+        y = nn.Dense(1)(x)
+        return jnp.squeeze(y, axis=-1)
+
+
+
 class TI_CNN(nn.Module):
     """1D translation-invariant CNN with 2 features per lattice site (periodic BCs).
 
