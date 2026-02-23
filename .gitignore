@@ -3,3 +3,4 @@ __pycache__/
 sigma/sigma.ipynb
 sigma/latex.out
 sigma/sigma.aux
+sigma/params.npy
