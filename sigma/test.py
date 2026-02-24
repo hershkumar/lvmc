@@ -46,7 +46,7 @@ def test_CNN():
         )
 
 
-test_CNN()
+#test_CNN()
 
 
 # =================

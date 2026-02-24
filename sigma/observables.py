@@ -55,8 +55,8 @@ def local_L2_per_site_cartesian(model, params, config_xyz, site_i, eps=1e-8):
     sin_t = jnp.where(
         jnp.abs(sin_t) < eps, jnp.sign(sin_t) * eps + (sin_t == 0) * eps, sin_t
     )
-    sin2 = sin_t * sin_t
-    cot_t = jnp.cos(theta) / sin_t
+    sin2 = jnp.maximum(sin_t * sin_t, eps)
+    cot_t = jnp.cos(theta) * jax.lax.rsqrt(sin2)
 
     A_t, A_p = g[0], g[1]
     A_tt = H[0, 0]
@@ -96,11 +96,9 @@ def config_energy(model, eta, g, params, config_xyz):
     """
     Local energy for config in Cartesian (L,3), PBCs on the neighbor dot-product term.
 
-    Assumes Hamiltonian of the same form you used:
+    Assumes Hamiltonian:
       kinetic:   eta * g^2 * sum_i (L_i^2 psi)/psi
       potential: -(eta/g^2) * sum_i n_i · n_{i+1}   (PBC)
-
-    Adjust prefactors/signs if your convention differs.
     """
     kinetic_term = (
         eta * (g**2) * spherical_laplacian_cartesian(model, params, config_xyz)
