@@ -980,6 +980,7 @@ dependencies = [
     { name = "numpy" },
     { name = "optax" },
     { name = "plotly" },
+    { name = "scipy" },
     { name = "tqdm" },
 ]
 
@@ -997,6 +998,7 @@ requires-dist = [
     { name = "numpy", specifier = ">=2.4.2" },
     { name = "optax", specifier = ">=0.2.7" },
     { name = "plotly", specifier = ">=6.5.2" },
+    { name = "scipy", specifier = ">=1.17.0" },
     { name = "tqdm", specifier = ">=4.67.3" },
 ]
 
