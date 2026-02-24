@@ -120,7 +120,7 @@ def step_chain(params, model, eta, g, sampler, MC_options, prev_samples):
     # accept either (N,3) or (nchains,N,3)
     if prev_samples.shape == sampler.shape:
         prev_samples = jnp.broadcast_to(prev_samples, (nchains,) + sampler.shape)
-
+    
     samples, _ = sampler.run_many_chains(
         params,
         Nsweeps,

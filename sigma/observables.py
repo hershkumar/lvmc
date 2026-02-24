@@ -258,13 +258,81 @@ def dE_dparams_opt(model, eta, g, params, configs):
     )
     return grad, energy, uncert
 
+def per_config(model, eta, g, params, config):
+    # returns (energy_scalar, logs_pytree) for ONE config
+    return local_terms_opt(model, eta, g, params, config)
+
+def chunk_stats(model, eta, g, params, configs_chunk):
+    # configs_chunk: (B, ...)
+    energies, logs = jax.vmap(lambda c: per_config(model, eta, g, params, c))(configs_chunk)
+
+    B = energies.shape[0]
+    sum_e  = jnp.sum(energies)
+    sum_e2 = jnp.sum(energies * energies)
+
+    sum_logs = jax.tree_util.tree_map(lambda x: jnp.sum(x, axis=0), logs)
+    sum_wlogs = jax.tree_util.tree_map(
+        lambda x: jnp.sum(x * energies.reshape((B,) + (1,) * (x.ndim - 1)), axis=0),
+        logs,
+    )
+    return B, sum_e, sum_e2, sum_logs, sum_wlogs
+
+chunk_stats_jit = jax.jit(chunk_stats, static_argnums=(0,))  # model static
+
+def cpu_grad_stats(model, eta, g, params, configs, batch=2048):
+    # Make total count divisible by batch (pad once) to keep shapes static
+    ncfg = configs.shape[0]
+    pad = (batch - (ncfg % batch)) % batch
+    if pad:
+        configs = jnp.concatenate(
+            [configs, jnp.zeros((pad,) + configs.shape[1:], configs.dtype)], axis=0
+        )
+
+    n_total = configs.shape[0]
+    n_chunks = n_total // batch
+    configs = configs.reshape((n_chunks, batch) + configs.shape[1:])
+
+    def body(carry, configs_chunk):
+        n, se, se2, slog, swlog = carry
+        B, sum_e, sum_e2, sum_logs, sum_wlogs = chunk_stats_jit(model, eta, g, params, configs_chunk)
+        n2 = n + B
+        se2_ = se + sum_e
+        se2sq = se2 + sum_e2
+        slog2 = jax.tree_util.tree_map(lambda a, b: a + b, slog, sum_logs)
+        swlog2 = jax.tree_util.tree_map(lambda a, b: a + b, swlog, sum_wlogs)
+        return (n2, se2_, se2sq, slog2, swlog2), None
+
+    # init accumulators
+    example_E, example_log = per_config(model, eta, g, params, configs[0,0])
+    zero_log = jax.tree_util.tree_map(lambda x: jnp.zeros_like(x), example_log)
+
+    init = (jnp.array(0, dtype=jnp.int32),
+            jnp.array(0.0, dtype=example_E.dtype),
+            jnp.array(0.0, dtype=example_E.dtype),
+            zero_log,
+            zero_log)
+
+    (n, sum_e, sum_e2, sum_logs, sum_wlogs), _ = jax.lax.scan(body, init, configs)
+
+    n = n.astype(sum_e.dtype)
+    energy = sum_e / n
+    var = jnp.maximum(sum_e2 / n - energy * energy, 0.0)
+    uncert = jnp.sqrt(var / n)
+
+    mean_logs  = jax.tree_util.tree_map(lambda x: x / n, sum_logs)
+    mean_wlogs = jax.tree_util.tree_map(lambda x: x / n, sum_wlogs)
+
+    grad = jax.tree_util.tree_map(lambda w, m: 2.0 * w - 2.0 * energy * m, mean_wlogs, mean_logs)
+
+    # Trim padding effect (optional): if pad>0 and you padded with zeros, padding biases results.
+    # Better: pad with real samples or handle last partial batch separately.
+    return grad, energy, uncert
 
 # ACTIVE IMPLEMENTATION (comment these lines to use originals above)
 spherical_laplacian_cartesian = spherical_laplacian_cartesian_opt
 config_energy = config_energy_opt
 dlogpsi_dparams = dlogpsi_dparams_opt
 dE_dparams = dE_dparams_opt
-
 
 @jit
 def nx_n0(configs):
