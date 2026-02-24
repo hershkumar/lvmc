@@ -269,9 +269,19 @@ dE_dparams = dE_dparams_opt
 @jit
 def nx_n0(configs):
 
+    nxs = nx(configs)
+
     def nx_n0_single(config):
         n0 = config[0]
         return jnp.sum(config * n0[None, :], axis=-1)
 
-    C = jax.vmap(nx_n0_single)(configs)
-    return jnp.mean(C, axis=0)
+    C = jnp.mean(jax.vmap(nx_n0_single)(configs), axis=0)
+    for x in range(C.shape[0]):
+        prod = jnp.dot(nxs[x], nxs[0])
+        C = C.at[x].set(C[x] - prod)   
+    
+    return C
+
+@jit
+def nx(configs):
+    return jnp.mean(configs, axis=0)
