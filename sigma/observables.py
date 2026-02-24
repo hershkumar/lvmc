@@ -161,61 +161,69 @@ def dE_dparams(model, eta, g, params, configs):
 # Keep original functions above intact. To revert to originals, comment out the
 # alias assignments in the "ACTIVE IMPLEMENTATION" section below.
 
-
-def _local_L2_per_site_from_angles_opt(model, params, ang, site_i, eps=1e-8):
+def _spherical_lap_all_sites(model, params, ang, eps=1e-8):
     """
-    Same quantity as local_L2_per_site_cartesian, but takes precomputed angles.
-    This avoids recomputing cartesian->angles for every site in a configuration.
+    Compute spherical Laplacian for all sites in one pass.
+    Instead of vmap over sites with closure+grad, use jacrev/jacfwd
+    over the full angle array at once.
     """
+    def A_of_angles(ang_full):
+        xyz = angles_to_unitvec(ang_full)
+        return model.apply(params, xyz)
 
-    def A_of_site(ang_i):
-        ang2 = ang.at[site_i].set(ang_i)
-        xyz2 = angles_to_unitvec(ang2)
-        return model.apply(params, xyz2)
+    # Gradient: shape (L, 2)
+    g_all = jax.jacrev(A_of_angles)(ang)
+    # Hessian diagonal entries only — use forward-over-reverse for efficiency
+    # We only need H[i,j,i,j] (diagonal blocks), but jax.hessian gives full (L,2,L,2).
+    # Instead compute per-site Hessian diagonals using vmap over jvp.
+    L = ang.shape[0]
 
-    a0 = ang[site_i]
-    g_site = jax.grad(A_of_site)(a0)
-    H_site = jax.hessian(A_of_site)(a0)
+    # Compute diagonal of Hessian: d²A/d(ang[i,k])² for each (i,k)
+    # Using forward-over-reverse: one jvp per basis vector
+    def hvp(v):
+        # v: tangent vector, same shape as ang (L, 2)
+        return jax.jvp(jax.grad(A_of_angles), (ang,), (v,))[1]
 
-    theta = a0[0]
-    sin_t = jnp.sin(theta)
-    sin_t = jnp.where(
-        jnp.abs(sin_t) < eps, jnp.sign(sin_t) * eps + (sin_t == 0) * eps, sin_t
-    )
-    sin2 = sin_t * sin_t
-    cot_t = jnp.cos(theta) / sin_t
+    # We need diag of Hessian: entries (i,0,i,0) and (i,1,i,1)
+    # Build basis vectors for each of the 2L scalar params
+    basis = jnp.eye(L * 2).reshape(L * 2, L, 2)
+    # vmap hvp over all basis vectors
+    H_diag_flat = jax.vmap(hvp)(basis)  # (L*2, L, 2)
+    # H_diag_flat[k, :, :] = row k of Hessian; we want diagonal: entry k = H[k,k]
+    H_diag = H_diag_flat.reshape(L * 2, L * 2)  # full Hessian
+    # Extract diagonal, reshape to (L, 2)
+    H_diag = jnp.diag(H_diag).reshape(L, 2)
 
-    A_t, A_p = g_site[0], g_site[1]
-    A_tt = H_site[0, 0]
-    A_pp = H_site[1, 1]
+    thetas = ang[:, 0]
+    sin_t = jnp.sin(thetas)
+    sin_t = jnp.where(jnp.abs(sin_t) < eps, jnp.sign(sin_t) * eps + (sin_t == 0.0) * eps, sin_t)
+    sin2 = sin_t ** 2
+    cot_t = jnp.cos(thetas) / sin_t
+
+    A_t = g_all[:, 0]
+    A_p = g_all[:, 1]
+    A_tt = H_diag[:, 0]
+    A_pp = H_diag[:, 1]
 
     lap_A = A_tt + cot_t * A_t + A_pp / sin2
-    gradA_sq = (A_t * A_t) + (A_p * A_p) / sin2
-    return lap_A - gradA_sq
+    gradA_sq = A_t ** 2 + A_p ** 2 / sin2
+    return jnp.sum(lap_A - gradA_sq)
 
 
 @partial(jit, static_argnums=(0,))
 def spherical_laplacian_cartesian_opt(model, params, config_xyz):
     config_xyz = jnp.asarray(config_xyz)
-    ang = cartesian_to_angles(config_xyz)  # compute once per configuration
-    L = ang.shape[0]
-    vals = jax.vmap(
-        lambda i: _local_L2_per_site_from_angles_opt(model, params, ang, i)
-    )(jnp.arange(L))
-    return jnp.sum(vals)
+    ang = cartesian_to_angles(config_xyz)
+    return _spherical_lap_all_sites(model, params, ang)
 
 
 @partial(jit, static_argnums=(0,))
 def config_energy_opt(model, eta, g, params, config_xyz):
-    kinetic_term = (
-        eta * (g**2) * spherical_laplacian_cartesian_opt(model, params, config_xyz)
-    )
-
+    kinetic_term = eta * (g ** 2) * spherical_laplacian_cartesian_opt(model, params, config_xyz)
     n = jnp.asarray(config_xyz)
     n_next = jnp.roll(n, shift=-1, axis=0)
     nn = jnp.sum(n * n_next, axis=-1)
-    potential_term = -(eta / (g**2)) * jnp.sum(nn)
-    # NOTE: This kinetic term is off by a factor of 2 from Paulo's Hamiltonian.
+    potential_term = -(eta / (g ** 2)) * jnp.sum(nn)
     return 0.5 * kinetic_term + potential_term
 
 
@@ -232,11 +240,49 @@ def local_terms_opt(model, eta, g, params, config):
     return local_energy, lg
 
 
-@partial(jit, static_argnums=(0,))
-def dE_dparams_opt(model, eta, g, params, configs):
-    energies, logs = jax.vmap(
-        lambda config: local_terms_opt(model, eta, g, params, config), in_axes=0
-    )(configs)
+def _batched_vmap(f, configs, batch_size):
+    """
+    Apply f over configs in chunks of batch_size using lax.map over full
+    batches, handling remainders manually. Falls back to plain vmap if
+    batch_size is None or >= ncfg.
+    """
+    ncfg = configs.shape[0]
+    if batch_size is None or batch_size >= ncfg:
+        return jax.vmap(f)(configs)
+
+    n_full = (ncfg // batch_size) * batch_size
+    remainder = ncfg - n_full
+
+    # Process full batches via lax.map (constant memory per batch)
+    full_configs = configs[:n_full].reshape(ncfg // batch_size, batch_size, *configs.shape[1:])
+    batched_f = jax.vmap(f)
+    full_results = jax.lax.map(batched_f, full_configs)
+    # Flatten leading two dims
+    full_results = jax.tree_util.tree_map(
+        lambda x: x.reshape(n_full, *x.shape[2:]), full_results
+    )
+
+    if remainder == 0:
+        return full_results
+
+    rem_results = jax.vmap(f)(configs[n_full:])
+    return jax.tree_util.tree_map(
+        lambda a, b: jnp.concatenate([a, b], axis=0), full_results, rem_results
+    )
+
+
+@partial(jit, static_argnums=(0, 5))
+def dE_dparams_opt(model, eta, g, params, configs, batch_size=None):
+    """
+    Compute energy gradient over a batch of configurations.
+
+    Args:
+        batch_size: if provided, processes configs in chunks of this size to
+                    limit peak memory. Useful when ncfg is large. Must be a
+                    compile-time static integer (hence static_argnums).
+    """
+    local_fn = lambda config: local_terms_opt(model, eta, g, params, config)
+    energies, logs = _batched_vmap(local_fn, configs, batch_size)
 
     ncfg = energies.shape[0]
     energy = jnp.mean(energies)
@@ -254,10 +300,10 @@ def dE_dparams_opt(model, eta, g, params, configs):
     mean_weighted_logs = pytree_mean(weighted_logs)
 
     grad = pytree_add(
-        pytree_mult(2, mean_weighted_logs), pytree_mult(-2 * energy, mean_logs)
+        pytree_mult(2, mean_weighted_logs),
+        pytree_mult(-2 * energy, mean_logs)
     )
     return grad, energy, uncert
-
 
 # ACTIVE IMPLEMENTATION (comment these lines to use originals above)
 spherical_laplacian_cartesian = spherical_laplacian_cartesian_opt
