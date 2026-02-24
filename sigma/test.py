@@ -51,30 +51,27 @@ test_CNN()
 
 # =================
 # testing the sampler
-#print("Testing sampler...")
-#sampler = Sampler(psi, (N, 2))
+# print("Testing sampler...")
+# sampler = Sampler(psi, (N, 2))
 
-#nchains = 16
-#pos_initials = [jnp.zeros((N, 2)) for _ in range(nchains)]
-#seeds = jnp.arange(nchains)
-#var = 5
+# nchains = 16
+# pos_initials = [jnp.zeros((N, 2)) for _ in range(nchains)]
+# seeds = jnp.arange(nchains)
+# var = 5
 
-#samples, acc_rate = sampler.run_many_chains(
+# samples, acc_rate = sampler.run_many_chains(
 #    params, 1000, 100, 2, var, pos_initials, seeds
-#)
+# )
 #
-#print(f"Acceptance rate: {acc_rate}")
-#print(samples.shape)
+# print(f"Acceptance rate: {acc_rate}")
+# print(samples.shape)
 # =================
 
 
 # =============================
 # Testing observables
-random_sample = np.random.normal(size=(N,3))
+random_sample = np.random.normal(size=(N, 3))
 
 energy = config_energy(model, 1.0, 1.0, params, random_sample)
 print(energy)
 grad = dlogpsi_dparams(model, params, random_sample)
-
-
-

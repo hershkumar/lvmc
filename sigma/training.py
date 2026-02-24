@@ -42,7 +42,6 @@ def train(init_params, model, eta, g, sampler, MC_options, steps, lr, fig=None):
         uncert: List of uncertainties at each training step.
     """
 
-
     params = init_params
     tx = optax.adam(lr)
     opt_state = tx.init(params)
@@ -73,8 +72,6 @@ def train(init_params, model, eta, g, sampler, MC_options, steps, lr, fig=None):
             fig.data[2].x = steps_arr
             fig.data[2].y = lower
 
-
-
     # loop over training steps
 
     pbar = trange(steps, desc="", leave=True)
@@ -96,9 +93,6 @@ def train(init_params, model, eta, g, sampler, MC_options, steps, lr, fig=None):
         params = optax.apply_updates(params, updates)
 
     return params, avg_energies, avg_uncerts
-
-
-
 
 
 def step(params, model, eta, g, sampler, MC_options):

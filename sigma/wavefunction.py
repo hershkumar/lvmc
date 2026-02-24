@@ -27,30 +27,31 @@ class MLP(nn.Module):
         return jnp.squeeze(y, axis=-1)
 
 
-
-
-
-
 class MLP_TI(nn.Module):
     """
     Site-translation invariant network for inputs x with shape (..., N, 3).
     Translation invariance is enforced by taking the magnitude of the DFT along
     the *site axis* (axis=-2), which removes the phase that encodes the origin/shift.
     """
+
     hidden_sizes: Sequence[int] = (128, 128)
     activation: Callable = nn.celu
-    eps: float = 0.0  # optional: add a tiny eps inside sqrt for numerical stability if you want
+    eps: float = (
+        0.0  # optional: add a tiny eps inside sqrt for numerical stability if you want
+    )
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = jnp.asarray(x)
         if x.shape[-1] != 3:
-            raise ValueError(f"Expected last dim = 3 for Cartesian vectors; got {x.shape}.")
+            raise ValueError(
+                f"Expected last dim = 3 for Cartesian vectors; got {x.shape}."
+            )
 
         # x: (..., N, 3)
         # FFT over the site axis (axis=-2), separately for each channel.
-        Xk = jnp.fft.fft(x, axis=-2)              # (..., N, 3), complex
-        feat = jnp.abs(Xk)                        # (..., N, 3), real, shift-invariant
+        Xk = jnp.fft.fft(x, axis=-2)  # (..., N, 3), complex
+        feat = jnp.abs(Xk)  # (..., N, 3), real, shift-invariant
 
         # Optional: if you prefer a smooth magnitude (rarely needed)
         if self.eps != 0.0:
@@ -67,9 +68,6 @@ class MLP_TI(nn.Module):
 
         y = nn.Dense(1)(h)
         return jnp.squeeze(y, axis=-1)
-
-
-
 
 
 """
