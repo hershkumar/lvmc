@@ -112,7 +112,7 @@ class MLP_O3_TI(nn.Module):
     hidden_sizes: Sequence[int] = (128, 128)
     activation: Callable = nn.celu
     eps: float = 0.0
-    enforce_full_O3: bool = False  # if True, uses b_i -> b_i^2 to remove parity sign
+    enforce_full_O3: bool = True  # if True, uses b_i -> b_i^2 to remove parity sign
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
