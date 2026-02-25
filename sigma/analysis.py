@@ -6,10 +6,23 @@ from training import *
 import numpy as np
 
 
+def energy_density_plot(files):
+    fig = go.Figure()
+
+    # energy density as a function of beta = 1/g^2
+    gs = []
+    energy_densities = []
 
 
 
-# parameter imports
+
+
+
+
+
+def correlation_length_plot():
+
+    return
 
 
 

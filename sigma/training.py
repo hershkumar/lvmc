@@ -88,7 +88,7 @@ def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None):
             avg_energies.append(energy)
             avg_uncerts.append(uncert)
             # set the label of the tqdm bar to print the current energy
-            pbar.set_description(f"Energy = {energy}", refresh=True)
+            pbar.set_description(f"Energy Density = {energy/sampler.shape[0]}", refresh=True)
 
             if fig is not None:
                 push_point(fig, prev_max_step + step_num, energy, uncert)
@@ -103,7 +103,7 @@ def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None):
             grads, energy, uncert = comp
             avg_energies.append(energy)
             avg_uncerts.append(uncert)
-            pbar.set_description(f"Energy = {energy}", refresh=True)
+            pbar.set_description(f"Energy Density = {energy/sampler.shape[0]}", refresh=True)
 
             if fig is not None:
                 push_point(fig, prev_max_step + step_num, energy, uncert)
