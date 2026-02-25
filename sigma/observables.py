@@ -101,7 +101,7 @@ def config_energy(model, eta, g, params, config_xyz):
       potential: -(eta/g^2) * sum_i n_i · n_{i+1}   (PBC)
     """
     kinetic_term = (
-        eta * (g**2) * spherical_laplacian_cartesian(model, params, config_xyz)
+        0.5 * eta * (g**2) * spherical_laplacian_cartesian(model, params, config_xyz)
     )
 
     n = jnp.asarray(config_xyz)
