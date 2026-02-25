@@ -3,6 +3,7 @@ from jax import numpy as jnp
 from jax import jit
 from functools import partial
 from flax import linen as nn
+import jax
 from typing import Sequence, Callable, Optional
 
 """
@@ -107,6 +108,10 @@ class MLP_O3_TI(nn.Module):
 
     Note: b_i is a pseudoscalar (SO(3)-invariant, flips under reflections). If you need full
     O(3) invariance (including reflections), replace b_i by |b_i| or b_i^2.
+
+
+    Btw this doesn't actually work, it doesn't account for correlations in the fields for points far away i.e n_i and n_i+r 
+    for bigger r even though the actual fields are correlated
     """
 
     hidden_sizes: Sequence[int] = (128, 128)
@@ -150,6 +155,85 @@ class MLP_O3_TI(nn.Module):
 
         y = nn.Dense(1)(h)
         return jnp.squeeze(y, axis=-1)
+
+
+
+
+def gram_matrix(x: jnp.ndarray) -> jnp.ndarray:
+    """
+    x: (..., N, 3)
+    returns G: (..., N, N) with G[..., i, j] = n_i · n_j
+    """
+    return jnp.einsum("...id,...jd->...ij", x, x)
+
+
+def translation_invariant_gram_features(G: jnp.ndarray) -> jnp.ndarray:
+    """
+    Make features invariant under cyclic shifts i -> i+s (PBC) by averaging
+    the cyclic diagonals of the Gram matrix:
+
+      c[r] = (1/N) sum_i G[i, (i+r) mod N],   r=0..N-1
+
+    G: (..., N, N)
+    returns c: (..., N)
+    """
+    N = G.shape[-1]
+
+    def diag_mean(r):
+        # shift columns so that diagonal picks out (i, i+r)
+        Gs = jnp.roll(G, shift=-r, axis=-1)  # (..., N, N)
+        d = jnp.diagonal(Gs, axis1=-2, axis2=-1)  # (..., N)
+        return jnp.mean(d, axis=-1)  # (...)
+
+    c = jax.vmap(diag_mean)(jnp.arange(N))  # (N, ...)
+    return jnp.moveaxis(c, 0, -1)          # (..., N)
+
+
+class MLP_TI_Gram(nn.Module):
+    """
+    O(3)-invariant (via Gram) and translation-invariant (via cyclic-diagonal averaging)
+    MLP for inputs x (..., N, 3).
+
+    Pipeline:
+      1) (optional) normalize x to unit vectors
+      2) compute Gram G_ij = n_i · n_j
+      3) compute translation-invariant features c[r] = (1/N) sum_i G[i,i+r]
+      4) (optional) take |rFFT(c)| (not necessary; c is already TI)
+      5) standard MLP -> scalar
+    """
+    hidden_sizes: Sequence[int] = (128, 128)
+    activation: Callable = nn.celu
+    eps_norm: float = 1e-8
+
+    # optional: if you want the same “FFT magnitude” style as MLP_TI
+    use_fft: bool = False
+    eps_fft: float = 0.0
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x)
+        if x.shape[-1] != 3:
+            raise ValueError(f"Expected last dim = 3; got {x.shape}.")
+
+        G = gram_matrix(x)                         # (..., N, N)
+        c = translation_invariant_gram_features(G) # (..., N)
+
+        if self.use_fft:
+            Ck = jnp.fft.rfft(c, axis=-1)          # (..., N//2+1) complex
+            feat = Ck.real * Ck.real + Ck.imag * Ck.imag
+            if self.eps_fft != 0.0:
+                feat = feat + self.eps_fft
+        else:
+            feat = c                               # (..., N)
+
+        h = feat
+        for width in self.hidden_sizes:
+            h = nn.Dense(width)(h)
+            h = self.activation(h)
+
+        y = nn.Dense(1)(h)
+        return jnp.squeeze(y, axis=-1)
+
 
 
 """
