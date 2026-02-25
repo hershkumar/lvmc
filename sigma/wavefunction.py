@@ -157,36 +157,13 @@ class MLP_O3_TI(nn.Module):
         return jnp.squeeze(y, axis=-1)
 
 
-
-
-def gram_matrix(x: jnp.ndarray) -> jnp.ndarray:
-    """
-    x: (..., N, 3)
-    returns G: (..., N, N) with G[..., i, j] = n_i · n_j
-    """
-    return jnp.einsum("...id,...jd->...ij", x, x)
-
-
-def translation_invariant_gram_features(G: jnp.ndarray) -> jnp.ndarray:
-    """
-    Make features invariant under cyclic shifts i -> i+s (PBC) by averaging
-    the cyclic diagonals of the Gram matrix:
-
-      c[r] = (1/N) sum_i G[i, (i+r) mod N],   r=0..N-1
-
-    G: (..., N, N)
-    returns c: (..., N)
-    """
-    N = G.shape[-1]
-
-    def diag_mean(r):
-        # shift columns so that diagonal picks out (i, i+r)
-        Gs = jnp.roll(G, shift=-r, axis=-1)  # (..., N, N)
-        d = jnp.diagonal(Gs, axis1=-2, axis2=-1)  # (..., N)
-        return jnp.mean(d, axis=-1)  # (...)
-
-    c = jax.vmap(diag_mean)(jnp.arange(N))  # (N, ...)
-    return jnp.moveaxis(c, 0, -1)          # (..., N)
+def corr_all_r(x):
+    # x: (..., N, 3)
+    N = x.shape[-2]
+    def corr_r(r):
+        xr = jnp.roll(x, shift=-r, axis=-2)
+        return jnp.mean(jnp.sum(x * xr, axis=-1), axis=-1)  # (...) mean over sites
+    return jax.vmap(corr_r)(jnp.arange(N)).swapaxes(0, -1)  # (..., N)
 
 
 class MLP_TI_Gram(nn.Module):
@@ -205,9 +182,6 @@ class MLP_TI_Gram(nn.Module):
     activation: Callable = nn.celu
     eps_norm: float = 1e-8
 
-    # optional: if you want the same “FFT magnitude” style as MLP_TI
-    use_fft: bool = False
-    eps_fft: float = 0.0
 
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
@@ -215,16 +189,9 @@ class MLP_TI_Gram(nn.Module):
         if x.shape[-1] != 3:
             raise ValueError(f"Expected last dim = 3; got {x.shape}.")
 
-        G = gram_matrix(x)                         # (..., N, N)
-        c = translation_invariant_gram_features(G) # (..., N)
+        c = corr_all_r(x) # (..., N)
 
-        if self.use_fft:
-            Ck = jnp.fft.rfft(c, axis=-1)          # (..., N//2+1) complex
-            feat = Ck.real * Ck.real + Ck.imag * Ck.imag
-            if self.eps_fft != 0.0:
-                feat = feat + self.eps_fft
-        else:
-            feat = c                               # (..., N)
+        feat = c                               # (..., N)
 
         h = feat
         for width in self.hidden_sizes:
