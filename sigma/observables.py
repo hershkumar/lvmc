@@ -321,11 +321,14 @@ def nx_n0(configs):
         return jnp.sum(config * n0[None, :], axis=-1)
 
     C = jnp.mean(jax.vmap(nx_n0_single)(configs), axis=0)
+    # compute the uncertainty of C[r] as stddev/sqrt(Ncfg)
+    uncerts = jnp.std(jax.vmap(nx_n0_single)(configs), axis=0) / jnp.sqrt(configs.shape[0])
+
     for x in range(C.shape[0]):
         prod = jnp.dot(nxs[x], nxs[0])
         C = C.at[x].set(C[x] - prod)   
     
-    return C
+    return C, uncerts
 
 @jit
 def nx(configs):
