@@ -330,9 +330,26 @@ def nx_n0(configs):
     
     return C, uncerts
 
+# we want to compute the correlation function that takes into account the fact that the system is translationally invariant, so we average over all pairs of sites separated by distance r. This should give us a better estimate of the correlation function and reduce noise.
+@jit
+def Cr(configs):
+    nxs = nx(configs)
+
+    def Cr_single(config, r):
+        return jnp.mean(jnp.sum(config * jnp.roll(config, shift=-r, axis=0), axis=-1))
+
+    L = configs.shape[1]
+    C = jnp.array([jnp.mean(jax.vmap(lambda config: Cr_single(config, r))(configs)) for r in range(L)])
+    C_uncerts = jnp.array([jnp.std(jax.vmap(lambda config: Cr_single(config, r))(configs)) / jnp.sqrt(configs.shape[0]) for r in range(L)])
+    return C, C_uncerts
+
+
+
 @jit
 def nx(configs):
     return jnp.mean(configs, axis=0)
+
+
 
 
 
@@ -388,6 +405,23 @@ def add_damping(Sv, v, damping: float = 1e-3):
 # SR statistics
 # ---------------------------------------------------------------------------
 
+def clip_local_energies(energies, n_mad=5.0):
+    """
+    Clip local energies to  [median - n_mad * MAD, median + n_mad * MAD]
+    where MAD = median absolute deviation.
+
+    This is applied only to the gradient/Fisher estimates — the reported
+    energy uses the raw (unclipped) mean so you can still see spikes in
+    the monitoring output and know when something is wrong.
+
+    n_mad=5 is a standard choice; tighten to 3 if spikes persist,
+    loosen to 10 if you're worried about biasing the gradient.
+    """
+    median  = jnp.median(energies)
+    mad     = jnp.median(jnp.abs(energies - median))
+    return jnp.clip(energies, median - n_mad * mad, median + n_mad * mad)
+
+
 @partial(jit, static_argnums=(0, 5))
 def sr_stats(model, eta, g_coup, params, configs, batch_size=None):
     """
@@ -396,26 +430,24 @@ def sr_stats(model, eta, g_coup, params, configs, batch_size=None):
     Returns:
         grad:           pytree  SR gradient 2 * Cov(E, O).
         logs_centered:  pytree  centred log-derivative samples (N, ...).
-        E:              scalar  mean local energy.
-        uncert:         scalar  standard error of the mean energy.
+        E:              scalar  mean local energy (unclipped, for monitoring).
+        uncert:         scalar  standard error of the mean energy (unclipped).
     """
     local_fn = lambda config: local_terms_opt(model, eta, g_coup, params, config)
     energies, logs = _batched_vmap(local_fn, configs, batch_size)
 
     N = energies.shape[0]
-    E = jnp.mean(energies)
-
-    # Numerically stable variance via jnp.var (two-pass algorithm).
+    E      = jnp.mean(energies)
     uncert = jnp.sqrt(jnp.maximum(jnp.var(energies), 0.0) / N)
 
     mean_logs     = pytree_mean(logs)
     logs_centered = jax.tree_util.tree_map(lambda x, m: x - m, logs, mean_logs)
 
-    # Gradient: 2 * Cov(E, O) = 2 * mean_i( (E_i - <E>) * O_i )
-    # Centring energies before multiplying avoids catastrophic cancellation.
-    e_centered = energies - E  # (N,)
+    # Clip energies for gradient/Fisher only — E and uncert above are raw.
+    energies_clipped = clip_local_energies(energies)
+    e_centered       = energies_clipped - jnp.mean(energies_clipped)
 
-    def _grad_leaf(leaf):      # leaf: (N, *param_shape)
+    def _grad_leaf(leaf):
         return 2.0 * jnp.einsum("i,i...->...", e_centered, leaf) / N
 
     grad = jax.tree_util.tree_map(_grad_leaf, logs_centered)
