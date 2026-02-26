@@ -15,9 +15,11 @@ ams = [0.03983833718244804, 0.10496535796766744,0.12956120092378753,0.1558891454
 gs = np.sqrt(gsquareds)
 # one over ams
 xis_expected = 1/np.array(ams)
-
+print(gs)
+print(xis_expected)
 # our data
-
+g_obs = []
+xis_observed = []
 
 
 

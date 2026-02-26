@@ -333,3 +333,118 @@ def nx_n0(configs):
 @jit
 def nx(configs):
     return jnp.mean(configs, axis=0)
+
+
+
+
+
+
+### Testing SR implementation
+
+from jax.flatten_util import ravel_pytree
+
+
+
+# ---------------------------------------------------------------------------
+# Fisher matrix-vector product
+# ---------------------------------------------------------------------------
+
+def fisher_matvec(logs_centered, v):
+    """
+    Compute the Fisher (quantum geometric tensor) matrix-vector product:
+
+        [S v]_k  =  (1/N) sum_i  O_i^k  (O_i . v)
+
+    where O_i are the *centred* log-derivative samples (pytrees with a
+    leading sample axis of size N).
+
+    Args:
+        logs_centered: pytree; each leaf has shape (N, *param_shape).
+        v:             pytree; each leaf has shape (*param_shape).
+
+    Returns:
+        pytree with the same structure/shape as v.
+    """
+    # s_i = O_i . v — one scalar per sample                        (N,)
+    s = jax.vmap(lambda oi: pytree_dot(oi, v))(logs_centered)
+
+    # [Sv]_k = mean_i( s_i * O_i^k )
+    def _weighted_mean(leaf):   # leaf: (N, *param_shape)
+        return jnp.einsum("i,i...->...", s, leaf) / s.shape[0]
+
+    return jax.tree_util.tree_map(_weighted_mean, logs_centered)
+
+
+# ---------------------------------------------------------------------------
+# Damping
+# ---------------------------------------------------------------------------
+
+def add_damping(Sv, v, damping: float = 1e-3):
+    """Return  (S + damping * I) v  given S*v and v."""
+    return pytree_add(Sv, pytree_mult(damping, v))
+
+
+# ---------------------------------------------------------------------------
+# SR statistics
+# ---------------------------------------------------------------------------
+
+@partial(jit, static_argnums=(0, 5))
+def sr_stats(model, eta, g_coup, params, configs, batch_size=None):
+    """
+    Compute energy, gradient, and centred log-derivatives for SR.
+
+    Returns:
+        grad:           pytree  SR gradient 2 * Cov(E, O).
+        logs_centered:  pytree  centred log-derivative samples (N, ...).
+        E:              scalar  mean local energy.
+        uncert:         scalar  standard error of the mean energy.
+    """
+    local_fn = lambda config: local_terms_opt(model, eta, g_coup, params, config)
+    energies, logs = _batched_vmap(local_fn, configs, batch_size)
+
+    N = energies.shape[0]
+    E = jnp.mean(energies)
+
+    # Numerically stable variance via jnp.var (two-pass algorithm).
+    uncert = jnp.sqrt(jnp.maximum(jnp.var(energies), 0.0) / N)
+
+    mean_logs     = pytree_mean(logs)
+    logs_centered = jax.tree_util.tree_map(lambda x, m: x - m, logs, mean_logs)
+
+    # Gradient: 2 * Cov(E, O) = 2 * mean_i( (E_i - <E>) * O_i )
+    # Centring energies before multiplying avoids catastrophic cancellation.
+    e_centered = energies - E  # (N,)
+
+    def _grad_leaf(leaf):      # leaf: (N, *param_shape)
+        return 2.0 * jnp.einsum("i,i...->...", e_centered, leaf) / N
+
+    grad = jax.tree_util.tree_map(_grad_leaf, logs_centered)
+
+    return grad, logs_centered, E, uncert
+
+
+# ---------------------------------------------------------------------------
+# SR update (linear solve)
+# ---------------------------------------------------------------------------
+
+def sr_update(grad, logs_centered, damping: float = 1e-3, maxiter: int = 200):
+    """
+    Solve the SR linear system  (S + damping * I) delta = grad  via
+    conjugate gradients, staying entirely in pytree space (never forms
+    the full N_params x N_params matrix).
+
+    Args:
+        grad:           pytree  the energy gradient.
+        logs_centered:  pytree  centred log-derivative samples.
+        damping:        regularisation strength (default 1e-3).
+        maxiter:        CG iteration limit.
+
+    Returns:
+        delta:  pytree  the SR parameter update.
+        info:   int     0 if CG converged, >0 otherwise.
+    """
+    def matvec(v):
+        return add_damping(fisher_matvec(logs_centered, v), v, damping)
+
+    delta, info = jax.scipy.sparse.linalg.cg(matvec, grad, maxiter=maxiter)
+    return delta, info

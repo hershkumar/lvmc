@@ -1,5 +1,6 @@
+from jax.flatten_util import ravel_pytree
 from jax.tree_util import tree_map
-from jax.numpy import zeros_like, mean
+from jax.numpy import zeros_like, mean, dot, ndarray
 
 
 def pytree_mult(scalar, pytree):
@@ -28,3 +29,10 @@ def pytree_zeros_like(pytree):
     Returns a pytree with the same structure as the input pytree, but with all elements replaced by zeros.
     """
     return tree_map(zeros_like, pytree)
+
+
+def pytree_dot(a, b) -> ndarray:
+    """Inner product <a, b> over matching pytrees, returning a scalar."""
+    a_flat, _ = ravel_pytree(a)
+    b_flat, _ = ravel_pytree(b)
+    return dot(a_flat, b_flat)
