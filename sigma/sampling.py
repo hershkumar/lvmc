@@ -163,26 +163,26 @@ class newSampler:
                 f"Expected last dim = 3 for cartesian coords, got shape {self.shape}"
             )
 
-    def _mh_step(self, log_psi_fn, carry, rng_axis_log_u, angle):
+    def _mh_step(self, log_psi_fn, carry, rng_axis_logu_angle, stepsize):
         """
         One MH update with rotation proposals.
         carry = (pos, log_pos, acc)
-        rng_axis_log_u = (axis_raw, log_u)
+        rng_axis_logu_angle = (axis_raw, log_u, angle)
         """
         pos, log_pos, acc = carry
-        axis_raw, log_u = rng_axis_log_u
+        axis_raw, log_u, angle = rng_axis_logu_angle
 
         # axis_raw has shape self.shape; normalize to get unit axes per site
         axis = normalize(axis_raw, axis=-1)
 
-        # propose by rotating each site vector about a random axis by fixed small angle
+        # angle can be scalar, (leading dims...), or full self.shape[:-1]
+        # (rodrigues_rotate should broadcast over last dim=3)
         prop = rodrigues_rotate(pos, axis, angle)
-        # numerical safety: keep on sphere (should already be unit)
         prop = project_to_sphere(prop)
 
         log_new = log_psi_fn(prop)
 
-        # MH acceptance for target |psi|^2: accept if log u <= 2*(log|psi_new|-log|psi_old|)
+        # MH acceptance for target |psi|^2:
         accept = log_u <= 2.0 * (log_new - log_pos)
 
         pos_out = lax.select(accept, prop, pos)
@@ -193,8 +193,10 @@ class newSampler:
     @partial(jax.jit, static_argnums=(0, 2, 3, 4))
     def run_chain(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initial, seed):
         """
-        stepsize: rotation angle in radians (scalar).
-        Proposals: rotate each n_x by 'stepsize' around an independent random axis per site.
+        stepsize: max rotation angle in radians (scalar). Each proposal uses
+                  angle ~ Uniform(-stepsize, +stepsize).
+        Proposals: rotate each n_x by an independent random angle around an
+                   independent random axis per site.
         """
         pos = project_to_sphere(jnp.asarray(pos_initial))
         stepsize = jnp.asarray(stepsize, dtype=pos.dtype)
@@ -202,7 +204,6 @@ class newSampler:
         key = random.PRNGKey(seed)
 
         def log_psi_fn(x):
-            # If psi returns real amplitude: ok. If complex: |psi| ok.
             return jnp.log(jnp.abs(self.psi(params, x)) + 1e-300)
 
         log_pos = log_psi_fn(pos)
@@ -210,37 +211,54 @@ class newSampler:
 
         total_steps = Ntherm + Nsweeps * keep
 
-        key_axis, key_u = random.split(key)
-        # Random axes: Gaussian -> normalize
-        all_axis_raw = random.normal(key_axis, shape=(total_steps,) + self.shape, dtype=pos.dtype)
+        # keys for axes, MH uniforms, and angles
+        key_axis, key_u, key_ang = random.split(key, 3)
+
+        # Random axes: Gaussian -> normalize later
+        all_axis_raw = random.normal(
+            key_axis, shape=(total_steps,) + self.shape, dtype=pos.dtype
+        )
+
+        # log u for MH test
         all_log_u = jnp.log(random.uniform(key_u, shape=(total_steps,), dtype=pos.dtype))
 
+        # Independent random angle per site per step:
+        # shape is (total_steps,) + self.shape[:-1]
+        # (i.e., one scalar angle for each 3-vector)
+        all_angle = random.uniform(
+            key_ang,
+            shape=(total_steps,) + self.shape[:-1],
+            minval=-stepsize,
+            maxval=stepsize,
+            dtype=pos.dtype,
+        )
+
         def therm_step(carry, rng_i):
-            axis_raw_i, log_u_i = rng_i
-            carry = self._mh_step(log_psi_fn, carry, (axis_raw_i, log_u_i), stepsize)
+            axis_raw_i, log_u_i, ang_i = rng_i
+            carry = self._mh_step(log_psi_fn, carry, (axis_raw_i, log_u_i, ang_i), stepsize)
             return carry, None
 
         (pos, log_pos, acc_therm), _ = lax.scan(
             therm_step,
             (pos, log_pos, acc0),
-            xs=(all_axis_raw[:Ntherm], all_log_u[:Ntherm]),
+            xs=(all_axis_raw[:Ntherm], all_log_u[:Ntherm], all_angle[:Ntherm]),
         )
 
         axis_raw_s = all_axis_raw[Ntherm:]
         log_u_s = all_log_u[Ntherm:]
+        ang_s = all_angle[Ntherm:]
 
         def sample_step(carry, rng_i):
-            axis_raw_i, log_u_i = rng_i
-            carry = self._mh_step(log_psi_fn, carry, (axis_raw_i, log_u_i), stepsize)
+            axis_raw_i, log_u_i, ang_i = rng_i
+            carry = self._mh_step(log_psi_fn, carry, (axis_raw_i, log_u_i, ang_i), stepsize)
             return carry, carry[0]
 
         (_, _, acc_sample), all_pos = lax.scan(
             sample_step,
             (pos, log_pos, acc0),
-            xs=(axis_raw_s, log_u_s),
+            xs=(axis_raw_s, log_u_s, ang_s),
         )
 
-        # keep last sample of each sweep block
         samples = all_pos.reshape((Nsweeps, keep) + self.shape)[:, -1]
 
         total_acc = acc_therm + acc_sample
