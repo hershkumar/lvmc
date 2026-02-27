@@ -71,6 +71,97 @@ class MLP_TI(nn.Module):
         return jnp.squeeze(y, axis=-1)
 
 
+class CNN1D_TI(nn.Module):
+    """
+    Optimized translation-invariant 1D CNN for x (..., N, 3) with PBC (circular conv)
+    + global pooling + MLP head.
+
+    Optimizations vs your version:
+      - Avoids explicit jnp.concatenate padding each layer (memory/copy heavy).
+        Uses "gather with modulo" to implement circular padding (PBC) without materializing.
+      - Uses LayerNorm over channel dim only (stable, cheaper) and optional residual blocks.
+      - Keeps a configurable head via head_sizes.
+
+    Notes:
+      - Still translation-equivariant (ring) before pooling; pooling makes it invariant.
+      - Requires odd kernel sizes for symmetric receptive field.
+    """
+
+    channels: Sequence[int] = (64, 64, 64)
+    kernel_sizes: Sequence[int] = (5, 5, 5)
+    activation: Callable = nn.celu
+    use_layer_norm: bool = False
+    use_residual: bool = True
+    head_sizes: Sequence[int] = (128, 128)
+
+    @staticmethod
+    def _circular_pad_gather(h: jnp.ndarray, pad: int) -> jnp.ndarray:
+        """
+        Circular padding along site axis (-2) by indexing with modulo, without concat.
+        h: (..., N, C)
+        returns: (..., N + 2*pad, C)
+        """
+        if pad == 0:
+            return h
+        N = h.shape[-2]
+        idx = (jnp.arange(-pad, N + pad) % N).astype(jnp.int32)  # (N+2pad,)
+        return jnp.take(h, idx, axis=-2)
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x)
+        if x.shape[-1] != 3:
+            raise ValueError(f"Expected last dim = 3; got {x.shape}.")
+        if len(self.channels) != len(self.kernel_sizes):
+            raise ValueError("channels and kernel_sizes must have the same length.")
+
+        h = x  # (..., N, 3)
+
+        for li, (c, k) in enumerate(zip(self.channels, self.kernel_sizes)):
+            if k % 2 == 0:
+                raise ValueError("Use odd kernel sizes for symmetric circular padding.")
+            pad = k // 2
+
+            h_in = h
+
+            # circular padding without materializing concat
+            h_pad = self._circular_pad_gather(h, pad)  # (..., N+2pad, Cin)
+
+            # conv with VALID (now equivalent to circular conv)
+            h = nn.Conv(
+                features=c,
+                kernel_size=(k,),
+                strides=(1,),
+                padding="VALID",
+                use_bias=not self.use_layer_norm,  # bias often redundant with norm
+                name=f"conv_{li}",
+            )(h_pad)
+
+            if self.use_layer_norm:
+                # LayerNorm over channels (last dim) per site; stable for varying N
+                h = nn.LayerNorm(name=f"ln_{li}")(h)
+
+            h = self.activation(h)
+
+            # Optional residual connection (with projection if channels change)
+            if self.use_residual:
+                if h_in.shape[-1] != c:
+                    h_in_proj = nn.Dense(c, use_bias=False, name=f"res_proj_{li}")(h_in)
+                else:
+                    h_in_proj = h_in
+                h = h + h_in_proj
+
+        # translation-invariant pooling
+        h = jnp.mean(h, axis=-2)  # (..., channels[-1])
+
+        # MLP head (configurable)
+        for i, width in enumerate(self.head_sizes):
+            h = nn.Dense(width, name=f"head_dense_{i}")(h)
+            h = self.activation(h)
+
+        y = nn.Dense(1, name="out")(h)
+        return jnp.squeeze(y, axis=-1)
+
 
 def o3_local_invariants(x: jnp.ndarray):
     """
