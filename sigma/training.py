@@ -26,7 +26,7 @@ example_MC_options = {
 }
 
 
-def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None, batch_size=None):
+def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None, batch_size=None, clip_threshold=None):
     """
     Args:
         results: tuple of initial params, energies, and uncertainties (e.g. from a previous training run or from a pretraining step). If starting fresh, pass (init_params, [], []) where init_params are the initial parameters of the model.
@@ -37,15 +37,23 @@ def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None, batc
         lr: Learning rate for optimization.
         fig: optional argument, a plotly figure widget to update with training progress (energy and uncertainty). If None, no plotting is done.
         batch_size: optional argument, the number of samples to use in each batch for gradient computation. If None, all samples are used in each batch.
-
+        clip_threshold: optional argument, the maximum norm of gradients to be clipped. If None, no clipping is performed.
     Returns:
         params: The optimized parameters after training.
         energies: List of average energies at each training step.
         uncert: List of uncertainties at each training step.
+        last_samples: The last batch of samples generated (useful for resuming training with chain continuation).
     """
 
     params = results[0]
-    tx = optax.adam(lr)
+    if clip_threshold is not None:
+        tx = optax.chain(
+            optax.clip_by_global_norm(clip_threshold),
+            optax.adam(lr),
+        )
+    else:
+        tx = optax.adam(lr)
+
     opt_state = tx.init(params)
     step_nums = list(np.arange(len(results[1])))  # existing step numbers from results
     avg_energies = results[1]
