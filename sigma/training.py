@@ -345,3 +345,323 @@ def sr_train(results, model, eta, g, sampler, MC_options, steps, lr,
             prev_samples = samples.reshape((MC_options["nchains"], -1) + sampler.shape)[:, -1]
 
     return params, avg_energies, avg_uncerts
+
+
+
+
+
+def train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
+                target_accept=0.50, adapt_rate=0.05,
+                fig=None, batch_size=None, clip_threshold=None):
+    """
+    Like `train`, but adaptively tunes the MCMC proposal angle (MC_options["var"],
+    interpreted as degrees) at each step to keep the acceptance rate near
+    `target_accept` (default 50%).
+
+    MC_options["var"] is treated as a rotation angle in radians. The adaptation
+    rule is:
+
+        var_rad <- clip(var_rad * exp(adapt_rate * (accept_rate - target_accept)),
+                        1e-4, 2*pi)
+
+    So if acceptance is too high (proposals too small) -> angle grows.
+       If acceptance is too low  (proposals too large) -> angle shrinks.
+    The clamp to [1e-4, 2π] prevents degenerate values; 2π is the natural
+    upper bound for a rotation angle.
+
+    Args:
+        results:        tuple (init_params, energies, uncerts)
+        model:          neural network wavefunction
+        eta:            kinetic/interaction parameter passed to energy computation
+        g:              coupling constant
+        sampler:        MCMC sampler; run_many_chains must return (samples, accept_rate)
+                        where accept_rate is a scalar mean acceptance rate across chains
+        MC_options:     dict of Monte Carlo options. "var" is read as the initial
+                        proposal angle in radians and is NOT mutated.
+        steps:          number of training steps
+        lr:             Adam learning rate
+        target_accept:  desired acceptance rate (default 0.5)
+        adapt_rate:     controls adaptation speed (default 0.05); larger values
+                        converge faster but may oscillate more
+        fig:            optional plotly FigureWidget for live plotting
+        batch_size:     optional mini-batch size for gradient computation
+        clip_threshold: optional gradient clipping norm
+
+    Returns:
+        params:        optimized parameters after training
+        avg_energies:  list of average energies at each training step
+        avg_uncerts:   list of uncertainties at each training step
+    """
+    params = results[0]
+
+    if clip_threshold is not None:
+        tx = optax.chain(
+            optax.clip_by_global_norm(clip_threshold),
+            optax.adam(lr),
+        )
+    else:
+        tx = optax.adam(lr)
+
+    opt_state = tx.init(params)
+    step_nums    = list(np.arange(len(results[1])))
+    avg_energies = results[1]
+    avg_uncerts  = results[2]
+
+    # Work with a local copy of var (in radians) so the caller's dict is untouched
+    var_rad = float(MC_options["var"])
+
+    def push_point(fig, step, e, s):
+        step_nums.append(step)
+        avg_energies.append(e)
+        avg_uncerts.append(s)
+
+        steps_arr = jnp.asarray(step_nums)
+        E_arr     = jnp.asarray(avg_energies)
+        sig_arr   = jnp.asarray(avg_uncerts)
+
+        with fig.batch_update():
+            fig.data[0].x = steps_arr
+            fig.data[0].y = E_arr
+            fig.data[1].x = steps_arr
+            fig.data[1].y = E_arr + sig_arr
+            fig.data[2].x = steps_arr
+            fig.data[2].y = E_arr - sig_arr
+
+    prev_max_step = step_nums[-1] if step_nums else 0
+    pbar = trange(steps, desc="", leave=True)
+
+    if not MC_options["chain"]:
+        for step_num in pbar:
+            samples, accept_rate = sampler.run_many_chains(
+                params,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                MC_options["pos_initials"],
+                MC_options["seeds"],
+            )
+
+            # Adapt proposal angle toward target acceptance rate
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            grads, energy, uncert = dE_dparams(model, eta, g, params, samples,
+                                               batch_size=batch_size)
+
+            pbar.set_description(
+                f"E/N = {energy/sampler.shape[0]:.4f} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, prev_max_step + step_num, energy, uncert)
+            else:
+                avg_energies.append(energy)
+                avg_uncerts.append(uncert)
+
+            updates, opt_state = tx.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+
+    else:
+        prev_samples = MC_options["pos_initials"]
+        for step_num in pbar:
+            samples, accept_rate = sampler.run_many_chains(
+                params,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                prev_samples,
+                MC_options["seeds"],
+            )
+
+            # Adapt proposal angle toward target acceptance rate
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            grads, energy, uncert = dE_dparams(model, eta, g, params, samples,
+                                               batch_size=batch_size)
+
+            pbar.set_description(
+                f"E/N = {energy/sampler.shape[0]:.4f} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, prev_max_step + step_num, energy, uncert)
+            else:
+                avg_energies.append(energy)
+                avg_uncerts.append(uncert)
+
+            updates, opt_state = tx.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+
+            # Update chain continuation positions
+            prev_samples = samples.reshape(
+                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
+                + sampler.shape
+            )[:, -1]
+
+    return params, avg_energies, avg_uncerts
+
+
+
+
+
+
+
+def sr_train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
+                   damping_init=0.1, damping_final=1e-3, damping_decay=0.05,
+                   target_accept=0.50, adapt_rate=0.05,
+                   fig=None, batch_size=None):
+    """
+    Like `sr_train`, but additionally adapts the MCMC proposal angle
+    (MC_options["var"], in radians) at each step to keep the acceptance
+    rate near `target_accept` (default 50%).
+
+    Both the SR damping schedule and the angle adaptation run simultaneously:
+      - damping decays exponentially from damping_init -> damping_final
+      - var_rad adapts multiplicatively:
+            var_rad <- clip(var_rad * exp(adapt_rate * (accept - target_accept)),
+                            1e-4, 2*pi)
+
+    Args:
+        results:        tuple (init_params, energies, uncerts)
+        model:          neural network wavefunction
+        eta:            kinetic/interaction parameter
+        g:              coupling constant
+        sampler:        MCMC sampler; run_many_chains must return (samples, accept_rate)
+                        where accept_rate is a scalar mean acceptance rate across chains
+        MC_options:     dict of Monte Carlo options. "var" is read as the initial
+                        proposal angle in radians and is NOT mutated.
+        steps:          number of training steps
+        lr:             SR learning rate
+        damping_init:   initial Fisher matrix damping (default 0.1)
+        damping_final:  asymptotic damping value (default 1e-3)
+        damping_decay:  exponential decay rate for damping (default 0.05)
+        target_accept:  desired MCMC acceptance rate (default 0.5)
+        adapt_rate:     angle adaptation speed (default 0.05)
+        fig:            optional plotly FigureWidget for live plotting
+        batch_size:     optional mini-batch size for gradient computation
+
+    Returns:
+        params:        optimized parameters after training
+        avg_energies:  list of average energies at each training step
+        avg_uncerts:   list of uncertainties at each training step
+    """
+    params = results[0]
+    step_nums    = list(np.arange(len(results[1])))
+    avg_energies = results[1]
+    avg_uncerts  = results[2]
+
+    # Local copy of proposal angle in radians — caller's dict is never mutated
+    var_rad = float(MC_options["var"])
+
+    def push_point(fig, step, e, s):
+        step_nums.append(step)
+        avg_energies.append(e)
+        avg_uncerts.append(s)
+
+        steps_arr = jnp.asarray(step_nums)
+        E_arr     = jnp.asarray(avg_energies)
+        sig_arr   = jnp.asarray(avg_uncerts)
+
+        with fig.batch_update():
+            fig.data[0].x = steps_arr
+            fig.data[0].y = E_arr
+            fig.data[1].x = steps_arr
+            fig.data[1].y = E_arr + sig_arr
+            fig.data[2].x = steps_arr
+            fig.data[2].y = E_arr - sig_arr
+
+    prev_max_step = step_nums[-1] if step_nums else 0
+    pbar = trange(steps, desc="", leave=True)
+
+    if not MC_options["chain"]:
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                MC_options["pos_initials"],
+                MC_options["seeds"],
+            )
+
+            # Adapt proposal angle toward target acceptance rate
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            params, energy, uncert, info = sr_step(
+                model, eta, g, params, samples, lr,
+                damping=damping, clip_threshold=1.0, batch_size=batch_size,
+            )
+
+            pbar.set_description(
+                f"E/N = {energy/sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | cg = {info} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                avg_energies.append(energy)
+                avg_uncerts.append(uncert)
+
+    else:
+        prev_samples = MC_options["pos_initials"]
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                prev_samples,
+                MC_options["seeds"],
+            )
+
+            # Adapt proposal angle toward target acceptance rate
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            params, energy, uncert, info = sr_step(
+                model, eta, g, params, samples, lr,
+                damping=damping, clip_threshold=1.0, batch_size=batch_size,
+            )
+
+            pbar.set_description(
+                f"E/N = {energy/sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | cg = {info} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                avg_energies.append(energy)
+                avg_uncerts.append(uncert)
+
+            prev_samples = samples.reshape(
+                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
+                + sampler.shape
+            )[:, -1]
+
+    return params, avg_energies, avg_uncerts
