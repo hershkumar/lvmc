@@ -52,11 +52,8 @@ class MLP_TI(nn.Module):
         # x: (..., N, 3)
         # FFT over the site axis (axis=-2), separately for each channel.
         Xk = jnp.fft.fft(x, axis=-2)  # (..., N, 3), complex
-        feat = jnp.abs(Xk)  # (..., N, 3), real, shift-invariant
-
-        # Optional: if you prefer a smooth magnitude (rarely needed)
-        if self.eps != 0.0:
-            feat = jnp.sqrt((Xk.real**2 + Xk.imag**2) + self.eps)
+        # feat = jnp.abs(Xk)  # (..., N, 3), real, shift-invariant
+        feat = Xk  
 
         # Flatten frequency-and-channel features into a single vector for the MLP.
         feat = feat.reshape(*feat.shape[:-2], -1)  # (..., N*3)
@@ -68,6 +65,37 @@ class MLP_TI(nn.Module):
             h = self.activation(h)
 
         y = nn.Dense(1)(h)
+        return jnp.real(jnp.squeeze(y, axis=-1))
+
+class MLP_GREG(nn.Module):
+    hidden_sizes: Sequence[int] = (128, 128)
+    activation: Callable = nn.celu
+    # If True: use scalar bond lengths ||x_{i+1}-x_i|| as features (..., N)
+    # If False: use full vector differences x_{i+1}-x_i as features (..., N*D)
+    use_norm: bool = False
+    eps: float = 1e-12
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        # x: (..., N, D)
+        x = jnp.asarray(x)
+
+        # Nearest-neighbor differences with periodic boundary conditions:
+        # d_i = x_{i+1} - x_i
+        diffs = jnp.roll(x, shift=-1, axis=-2) - x  # (..., N, D)
+
+        if self.use_norm:
+            # scalar per bond (optionally stabilized)
+            features = jnp.sqrt(jnp.sum(diffs * diffs, axis=-1) + self.eps)  # (..., N)
+        else:
+            # flatten vector differences
+            features = diffs.reshape(*diffs.shape[:-2], -1)  # (..., N*D)
+
+        for h in self.hidden_sizes:
+            features = nn.Dense(h)(features)
+            features = self.activation(features)
+
+        y = nn.Dense(1)(features)
         return jnp.squeeze(y, axis=-1)
 
 
