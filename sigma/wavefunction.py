@@ -5,6 +5,8 @@ from functools import partial
 from flax import linen as nn
 import jax
 from typing import Sequence, Callable, Optional
+from dataclasses import field
+
 
 """
 Feedfoward network for outputting psi(U) given field configuration U in spherical basis
@@ -27,45 +29,202 @@ class MLP(nn.Module):
         y = nn.Dense(1)(x)
         return jnp.squeeze(y, axis=-1)
 
+
 class MLP_TI(nn.Module):
     """
-    Site-translation invariant network for inputs x with shape (..., N, 3).
-    Translation invariance is enforced by taking the magnitude of the DFT along
-    the *site axis* (axis=-2), which removes the phase that encodes the origin/shift.
+    Translation invariant MLP via gauge fixing of Fourier transform features
     """
-
     hidden_sizes: Sequence[int] = (128, 128)
     activation: Callable = nn.celu
-    eps: float = (
-        0.0  # optional: add a tiny eps inside sqrt for numerical stability if you want
-    )
-
+    eps: float = 1e-8
+    
     @nn.compact
-    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
-        x = jnp.asarray(x)
-        if x.shape[-1] != 3:
-            raise ValueError(
-                f"Expected last dim = 3 for Cartesian vectors; got {x.shape}."
-            )
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        n = jnp.asarray(n)
+        feats = translation_invariant_features_real(n, eps=self.eps)
+        mlp = MLP(hidden_sizes=self.hidden_sizes, activation=self.activation)
+        out = mlp(feats)
+        return out
 
-        # x: (..., N, 3)
-        # FFT over the site axis (axis=-2), separately for each channel.
-        Xk = jnp.fft.fft(x, axis=-2)  # (..., N, 3), complex
-        # feat = jnp.abs(Xk)  # (..., N, 3), real, shift-invariant
-        feat = Xk  
 
-        # Flatten frequency-and-channel features into a single vector for the MLP.
-        feat = feat.reshape(*feat.shape[:-2], -1)  # (..., N*3)
+class MLP_O3_TI(nn.Module):
+    """
+    Translation + full O(3) invariant scalar via:
+      SO(3) canonicalize -> translation-invariant Fourier features -> shared MLP
+      then symmetrize over one fixed reflection.
+    """
+    hidden_sizes: Sequence[int] = (128, 128)
+    activation: Callable = nn.celu
+    eps: float = 1e-8
 
-        # Standard MLP head
-        h = feat
-        for width in self.hidden_sizes:
-            h = nn.Dense(width)(h)
-            h = self.activation(h)
+    # Avoid mutable default by constructing inside __call__ (or use default_factory).
+    @nn.compact
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        n = jnp.asarray(n)
 
-        y = nn.Dense(1)(h)
-        return jnp.real(jnp.squeeze(y, axis=-1))
+        Px = jnp.diag(jnp.array([-1.0,  1.0,  1.0], dtype=n.dtype))
+        Py = jnp.diag(jnp.array([ 1.0, -1.0,  1.0], dtype=n.dtype))
+        Pz = jnp.diag(jnp.array([ 1.0,  1.0, -1.0], dtype=n.dtype))
 
+        n_std = canonicalize_so3(n, eps=self.eps)
+        feats = translation_invariant_features_real(n_std, eps=self.eps)
+
+        mlp = MLP(hidden_sizes=self.hidden_sizes, activation=self.activation)
+        out0 = mlp(feats)
+
+        def eval_ref(P):
+            n_ref = jnp.einsum("ij,...Lj->...Li", P, n_std)
+            feats_ref = translation_invariant_features_real(n_ref, eps=self.eps)
+            return mlp(feats_ref)
+
+        out = (out0 + eval_ref(Px) + eval_ref(Py) + eval_ref(Pz)) * 0.25
+        return out
+
+
+def rotz(a):
+    ca, sa = jnp.cos(a), jnp.sin(a)
+    return jnp.array([[ ca, -sa, 0.0],
+                      [ sa,  ca, 0.0],
+                      [0.0, 0.0, 1.0]], dtype=jnp.result_type(a, 1.0))
+
+def roty(a):
+    ca, sa = jnp.cos(a), jnp.sin(a)
+    return jnp.array([[ ca, 0.0,  sa],
+                      [0.0, 1.0, 0.0],
+                      [-sa, 0.0,  ca]], dtype=jnp.result_type(a, 1.0))
+
+
+def canonicalize_so3(n, eps=1e-8, return_R=False):
+    """
+    Translation-commuting SO(3) canonicalization using two covariant, translation-invariant vectors:
+      n_plus = sum_i n_i
+      q      = sum_i n_i x n_{i+1}   (periodic)
+
+    Fix frame by:
+      1) rotate so n_plus -> +z
+      2) use residual z-rotation to make (rotated q)_x = 0
+
+    n: (..., L, 3)
+    Returns:
+      n_std: (..., L, 3)
+      R:     (..., 3, 3)   (if return_R)
+      angles: (phi, theta, alpha) (if return_R)
+    """
+    n = jnp.asarray(n)
+    L = n.shape[-2]
+
+    # n_plus (translation-invariant, rotation-covariant)
+    n_plus = jnp.sum(n, axis=-2)  # (..., 3)
+
+    # q = sum_i n_i x n_{i+1} with periodic boundary (also translation-invariant, rotation-covariant)
+    n_next = jnp.roll(n, shift=-1, axis=-2)   # (..., L, 3)
+    q = jnp.sum(jnp.cross(n, n_next), axis=-2)  # (..., 3)
+
+    # Step 1: rotate about z to put n_plus into xz-plane
+    phi = jnp.arctan2(n_plus[..., 1], n_plus[..., 0])
+    R1 = rotz(-phi)
+
+    nplus1 = jnp.einsum("...ij,...j->...i", R1, n_plus)
+    r = jnp.sqrt(nplus1[..., 0]**2 + nplus1[..., 1]**2 + eps)
+
+    # Step 2: rotate about y to send n_plus -> +z
+    theta = jnp.arctan2(r, nplus1[..., 2])
+    R2 = roty(-theta)
+
+    # Rotate q into the same intermediate frame
+    q2 = jnp.einsum("...ij,...j->...i", R2, jnp.einsum("...ij,...j->...i", R1, q))
+    a, b = q2[..., 0], q2[..., 1]
+
+    # Step 3: residual z-rotation to make x component of q vanish
+    # After Rz(alpha): x' = a cosα - b sinα, choose alpha = atan2(a, b)
+    alpha = jnp.arctan2(a, b)
+    R3 = rotz(alpha)
+
+    R = jnp.einsum("...ij,...jk->...ik", R3, jnp.einsum("...ij,...jk->...ik", R2, R1))
+    n_std = jnp.einsum("...ij,...Lj->...Li", R, n)
+
+    # Degeneracies: if n_plus ~ 0 or q transverse component ~ 0, frame is ambiguous
+    deg1 = jnp.linalg.norm(n_plus, axis=-1) < eps
+    deg2 = (a*a + b*b) < (eps*eps)
+    deg = deg1 | deg2
+
+    I = jnp.eye(3, dtype=n.dtype)
+    R = jnp.where(deg[..., None, None], I, R)
+    n_std = jnp.where(deg[..., None, None], n, n_std)
+
+    if return_R:
+        return n_std, R, (phi, theta, alpha)
+    return n_std
+
+
+def _translation_invariant_tilde_y(y, eps=1e-8, axis=-1):
+    """
+    y: complex FFT coefficients along `axis`, length L.
+    Implements  y~_l = y_l * (|y_1|/y_1)^l  in a numerically-stable way.
+    """
+    L = y.shape[axis]
+    y1 = jnp.take(y, 1, axis=axis)
+
+    # Stable version of |y1|/y1 = exp(-i arg(y1)):
+    # u = conj(y1)/(|y1|+eps)  ~ (|y1|/y1)
+    u = jnp.conj(y1) / (jnp.abs(y1) + eps)
+
+    l = jnp.arange(L, dtype=jnp.result_type(jnp.real(y1), 1.0))  # (L,)
+
+    # Broadcast u**l along the FFT axis
+    # Create a shape like (1,1,...,L,...,1) for l and align to `axis`.
+    shape = [1] * y.ndim
+    shape[axis] = L
+    l = l.reshape(shape)
+
+    # Expand u to broadcast along axis
+    u = jnp.expand_dims(u, axis=axis)
+
+    return y * (u ** l)
+
+def translation_invariant_features_real(x, eps=1e-8):
+    """
+    Real-valued fields -> real-valued translation-invariant features using the paper procedure.
+
+    Inputs
+    ------
+    x : array
+        Either shape (..., L)   (single real signal)
+        or     shape (..., L, C) (C channels, e.g. C=3 components of O(3) field)
+
+    Returns
+    -------
+    feats : real array
+        For each channel independently, computes FFT y_l, then y~_l, then outputs only real numbers:
+          [Re(y~_0), Re(y~_1), Re(y~_2..y~_{L-1}), Im(y~_2..y~_{L-1})]
+        Shapes:
+          - input (..., L)     -> output (..., 2L-2)
+          - input (..., L, C)  -> output (..., C, 2L-2)
+    """
+    x = jnp.asarray(x)
+    if x.ndim >= 2 and x.shape[-1] != x.shape[-2] and x.shape[-1] <= 64:
+        # Treat as (..., L, C) channels in last axis
+        # FFT along L axis = -2
+        y = jnp.fft.fft(x, axis=-2)
+        y_tilde = _translation_invariant_tilde_y(y, eps=eps, axis=-2)
+
+        re = jnp.real(y_tilde)
+        im = jnp.imag(y_tilde)
+
+        # Build real-only feature vector along L axis
+        feat = jnp.concatenate([re[..., 0:2, :], re[..., 2:, :], im[..., 2:, :]], axis=-2)  # (..., 2L-2, C)
+        feat = jnp.swapaxes(feat, -1, -2)  # (..., C, 2L-2)
+        return feat
+    else:
+        # Treat as (..., L)
+        y = jnp.fft.fft(x, axis=-1)
+        y_tilde = _translation_invariant_tilde_y(y, eps=eps, axis=-1)
+
+        re = jnp.real(y_tilde)
+        im = jnp.imag(y_tilde)
+
+        feat = jnp.concatenate([re[..., 0:2], re[..., 2:], im[..., 2:]], axis=-1)  # (..., 2L-2)
+        return feat
 
 
 
