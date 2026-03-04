@@ -47,6 +47,29 @@ class MLP_TI(nn.Module):
         return out
 
 
+
+class MLP_SO3(nn.Module):
+    """
+    Translation + full O(3) invariant scalar via:
+      SO(3) canonicalize -> translation-invariant Fourier features -> shared MLP
+      then symmetrize over one fixed reflection.
+    """
+    hidden_sizes: Sequence[int] = (128, 128)
+    activation: Callable = nn.celu
+    eps: float = 1e-8
+
+    # Avoid mutable default by constructing inside __call__ (or use default_factory).
+    @nn.compact
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        n = jnp.asarray(n)
+
+        n_std = canonicalize_so3_smooth(n, eps=self.eps)
+        feats = n_std
+        mlp = MLP(hidden_sizes=self.hidden_sizes, activation=self.activation)
+        out = mlp(feats)
+        return out
+
+
 class MLP_O3_TI(nn.Module):
     """
     Translation + full O(3) invariant scalar via:
@@ -92,6 +115,12 @@ def roty(a):
     return jnp.array([[ ca, 0.0,  sa],
                       [0.0, 1.0, 0.0],
                       [-sa, 0.0,  ca]], dtype=jnp.result_type(a, 1.0))
+
+def rotx(a):
+    ca, sa = jnp.cos(a), jnp.sin(a)
+    return jnp.array([[1.0, 0.0, 0.0],
+                      [0.0,  ca, -sa],
+                      [0.0,  sa,  ca]], dtype=jnp.result_type(a, 1.0))
 
 
 def canonicalize_so3(n, eps=1e-8, return_R=False):
@@ -156,6 +185,84 @@ def canonicalize_so3(n, eps=1e-8, return_R=False):
         return n_std, R, (phi, theta, alpha)
     return n_std
 
+def _safe_norm(v, eps=1e-8):
+    return jnp.sqrt(jnp.sum(v * v, axis=-1, keepdims=True) + eps)
+
+def _normalize(v, eps=1e-8):
+    return v / _safe_norm(v, eps)
+
+def canonicalize_so3_smooth(n, eps=1e-8, k_shifts=(1, 2, 3)):
+    """
+    Smooth, translation-commuting SO(3) canonicalization (no atan2, no hard branches).
+
+    Builds an orthonormal frame (e1,e2,e3) from translation-invariant, rotation-covariant vectors:
+      v0 = n_plus = sum_i n_i
+      qk = sum_i n_i x n_{i+k}   (periodic, for several k)
+      q_eff = weighted sum of qk (weights depend smoothly on ||qk||)
+
+    Frame:
+      e3 = normalize(v0)
+      q_perp = q_eff - (q_eff·e3)e3
+      e1 = normalize(q_perp)
+      e2 = normalize(e3 x e1)
+
+    Rotation matrix R has rows [e1^T; e2^T; e3^T] so that for any site vector u:
+      u_std = R u
+    and the standardized field is n_std[..., i, :] = R @ n[..., i, :].
+
+    Properties:
+      - Translation commuting: uses only sums and periodic rolls.
+      - SO(3) gauge-fixing is smooth; degeneracies are handled by eps-regularized normalization
+        (still ill-conditioned if both n_plus and all qk_perp are ~0, but no discontinuities).
+
+    Args:
+      n: (..., L, 3)
+      eps: small positive for smooth normalization
+      k_shifts: tuple of neighbor offsets used to build q_eff
+      return_R: if True, returns (n_std, R)
+
+    Returns:
+      n_std: (..., L, 3)
+      R: (..., 3, 3) if return_R
+    """
+    n = jnp.asarray(n)
+    L = n.shape[-2]
+
+    # v0 = sum_i n_i (translation-invariant, covariant)
+    v0 = jnp.sum(n, axis=-2)  # (..., 3)
+    e3 = _normalize(v0, eps)  # (..., 3)
+
+    # Build multiple chirality-like covariant vectors qk = sum_i n_i x n_{i+k}
+    qs = []
+    q_norm2 = []
+    for k in k_shifts:
+        n_k = jnp.roll(n, shift=-int(k), axis=-2)
+        qk = jnp.sum(jnp.cross(n, n_k), axis=-2)  # (..., 3)
+        qs.append(qk)
+        q_norm2.append(jnp.sum(qk * qk, axis=-1, keepdims=True))  # (..., 1)
+
+    qs = jnp.stack(qs, axis=-2)         # (..., K, 3)
+    q_norm2 = jnp.stack(q_norm2, axis=-2)  # (..., K, 1)
+
+    # Smooth weights: emphasize the largest-norm qk but without argmax discontinuity
+    # w_k = norm^2 / (sum norm^2 + eps)
+    w = q_norm2 / (jnp.sum(q_norm2, axis=-2, keepdims=True) + eps)  # (..., K, 1)
+    q_eff = jnp.sum(w * qs, axis=-2)  # (..., 3)
+
+    # Project q_eff perpendicular to e3 and normalize to get e1
+    dot_qe3 = jnp.sum(q_eff * e3, axis=-1, keepdims=True)  # (..., 1)
+    q_perp = q_eff - dot_qe3 * e3
+    e1 = _normalize(q_perp, eps)
+
+    # e2 completes right-handed frame
+    e2 = _normalize(jnp.cross(e3, e1), eps)
+
+    # Assemble rotation matrix with rows [e1; e2; e3]
+    R = jnp.stack([e1, e2, e3], axis=-2)  # (..., 3, 3)
+
+    # Apply to all sites
+    n_std = jnp.einsum("...ij,...Lj->...Li", R, n)
+    return n_std
 
 def _translation_invariant_tilde_y(y, eps=1e-8, axis=-1):
     """
