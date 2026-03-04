@@ -160,62 +160,54 @@ def dE_dparams(model, eta, g, params, configs):
 # Optimized observables implementation (toggleable)
 # Keep original functions above intact. To revert to originals, comment out the
 # alias assignments in the "ACTIVE IMPLEMENTATION" section below.
-
-def _spherical_lap_all_sites(model, params, ang, eps=1e-8):
+def _lap_s2_all_sites_cartesian(model, params, xyz):
     """
-    Compute spherical Laplacian for all sites in one pass.
-    Instead of vmap over sites with closure+grad, use jacrev/jacfwd
-    over the full angle array at once.
+    xyz: (L,3) assumed ~unit vectors
+    returns sum_i [Δ_{S^2,i} A - |∇_{S^2,i}A|^2]
+    where A = model.apply(params, xyz).
     """
-    def A_of_angles(ang_full):
-        xyz = angles_to_unitvec(ang_full)
-        return model.apply(params, xyz)
+    xyz = jnp.asarray(xyz)
+    L = xyz.shape[0]
 
-    # Gradient: shape (L, 2)
-    g_all = jax.jacrev(A_of_angles)(ang)
-    # Hessian diagonal entries only — use forward-over-reverse for efficiency
-    # We only need H[i,j,i,j] (diagonal blocks), but jax.hessian gives full (L,2,L,2).
-    # Instead compute per-site Hessian diagonals using vmap over jvp.
-    L = ang.shape[0]
+    def A_of_xyz(xyz_full):
+        return model.apply(params, xyz_full)
 
-    # Compute diagonal of Hessian: d²A/d(ang[i,k])² for each (i,k)
-    # Using forward-over-reverse: one jvp per basis vector
+    # Cartesian gradient wrt all xyz: (L,3)
+    g_all = jax.jacrev(A_of_xyz)(xyz)
+
+    # Hessian-vector product helper: returns (L,3)
     def hvp(v):
-        # v: tangent vector, same shape as ang (L, 2)
-        return jax.jvp(jax.grad(A_of_angles), (ang,), (v,))[1]
+        return jax.jvp(jax.grad(A_of_xyz), (xyz,), (v,))[1]
 
-    # We need diag of Hessian: entries (i,0,i,0) and (i,1,i,1)
-    # Build basis vectors for each of the 2L scalar params
-    basis = jnp.eye(L * 2).reshape(L * 2, L, 2)
-    # vmap hvp over all basis vectors
-    H_diag_flat = jax.vmap(hvp)(basis)  # (L*2, L, 2)
-    # H_diag_flat[k, :, :] = row k of Hessian; we want diagonal: entry k = H[k,k]
-    H_diag = H_diag_flat.reshape(L * 2, L * 2)  # full Hessian
-    # Extract diagonal, reshape to (L, 2)
-    H_diag = jnp.diag(H_diag).reshape(L, 2)
+    # Build basis for all 3L components (flattened)
+    basis = jnp.eye(3 * L, dtype=xyz.dtype).reshape(3 * L, L, 3)
+    H_rows = jax.vmap(hvp)(basis)           # (3L, L, 3)
+    H_full = H_rows.reshape(3 * L, 3 * L)   # full Hessian in flattened coords
 
-    thetas = ang[:, 0]
-    sin_t = jnp.sin(thetas)
-    sin_t = jnp.where(jnp.abs(sin_t) < eps, jnp.sign(sin_t) * eps + (sin_t == 0.0) * eps, sin_t)
-    sin2 = sin_t ** 2
-    cot_t = jnp.cos(thetas) / sin_t
+    # Extract each site's 3x3 block diagonal trace projected to tangent space
+    # We'll do it by forming the 3x3 block for each site from H_full.
+    def per_site(i):
+        n = xyz[i]              # (3,)
+        g = g_all[i]            # (3,)
+        P = jnp.eye(3, dtype=xyz.dtype) - jnp.outer(n, n)  # tangent projector
 
-    A_t = g_all[:, 0]
-    A_p = g_all[:, 1]
-    A_tt = H_diag[:, 0]
-    A_pp = H_diag[:, 1]
+        # 3x3 block for site i in flattened Hessian
+        idx = jnp.arange(3) + 3 * i
+        Hii = H_full[jnp.ix_(idx, idx)]     # (3,3)
 
-    lap_A = A_tt + cot_t * A_t + A_pp / sin2
-    gradA_sq = A_t ** 2 + A_p ** 2 / sin2
-    return jnp.sum(lap_A - gradA_sq)
+        lap_A = jnp.sum(P * Hii) - 2.0 * jnp.dot(n, g)     # (P:H) - 2 n·g
+        gradA_sq = jnp.dot(g, g) - jnp.dot(n, g) ** 2      # g^T P g
 
+        return lap_A - gradA_sq
 
-@partial(jit, static_argnums=(0,))
+    return jnp.sum(jax.vmap(per_site)(jnp.arange(L)))
+
+@partial(jax.jit, static_argnums=(0,))
 def spherical_laplacian_cartesian_opt(model, params, config_xyz):
     config_xyz = jnp.asarray(config_xyz)
-    ang = cartesian_to_angles(config_xyz)
-    return _spherical_lap_all_sites(model, params, ang)
-
+    # Optional: renormalize to unit length to reduce drift
+    config_xyz = config_xyz / (jnp.linalg.norm(config_xyz, axis=-1, keepdims=True) + 1e-12)
+    return _lap_s2_all_sites_cartesian(model, params, config_xyz)
 
 @partial(jit, static_argnums=(0,))
 def config_energy_opt(model, eta, g, params, config_xyz):
