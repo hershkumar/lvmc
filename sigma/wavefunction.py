@@ -9,7 +9,7 @@ from dataclasses import field
 
 
 """
-Feedfoward network for outputting psi(U) given field configuration U in spherical basis
+Feedfoward network for outputting psi(n(x)) given field configuration n(x) in cartesian coordinates with constraint n(x).n(x)=1
 """
 
 
@@ -63,7 +63,7 @@ class MLP_SO3(nn.Module):
     def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
         n = jnp.asarray(n)
 
-        n_std = canonicalize_so3_smooth(n, eps=self.eps)
+        n_std = canonicalize_so3_xaxis(n, eps=self.eps)
         feats = n_std
         mlp = MLP(hidden_sizes=self.hidden_sizes, activation=self.activation)
         out = mlp(feats)
@@ -181,9 +181,63 @@ def canonicalize_so3(n, eps=1e-8, return_R=False):
     R = jnp.where(deg[..., None, None], I, R)
     n_std = jnp.where(deg[..., None, None], n, n_std)
 
-    if return_R:
-        return n_std, R, (phi, theta, alpha)
     return n_std
+
+
+def canonicalize_so3_xaxis(n, eps=1e-8, return_R=False):
+    """
+    Canonicalization variant:
+      1) Rotate so n_plus = sum_i n_i points along +x
+      2) Use residual rotation about x to enforce (q')_z = 0, where
+         q = sum_i n_i x n_{i+1} (periodic), q' is q after step (1).
+
+    n: (..., L, 3)
+    Returns:
+      n_std: (..., L, 3)
+      R:     (..., 3, 3) and angles if return_R
+    """
+    n = jnp.asarray(n)
+    L = n.shape[-2]
+
+    # translation-invariant, rotation-covariant vectors
+    n_plus = jnp.sum(n, axis=-2)  # (..., 3)
+    n_next = jnp.roll(n, shift=-1, axis=-2)
+    q = jnp.sum(jnp.cross(n, n_next), axis=-2)  # (..., 3)
+
+    # --- Step 1: send n_plus -> +x ---
+    # R1 = Rz(-phi) makes y component 0 (puts n_plus in xz-plane)
+    phi = jnp.arctan2(n_plus[..., 1], n_plus[..., 0])
+    R1 = rotz(-phi)
+    nplus1 = jnp.einsum("...ij,...j->...i", R1, n_plus)  # (...,3)
+
+    # Now nplus1 = (r, 0, z). Choose theta so that Ry(theta) makes z -> 0 (points to +x).
+    r = jnp.sqrt(nplus1[..., 0]**2 + nplus1[..., 1]**2 + eps)
+    theta = jnp.arctan2(nplus1[..., 2], r)   # tan(theta) = z/r
+    R2 = roty(theta)
+
+    # --- Step 2: residual rotation about x to make q_z = 0 ---
+    q2 = jnp.einsum("...ij,...j->...i", R2, jnp.einsum("...ij,...j->...i", R1, q))
+    # After Rx(alpha): z' = qy sinα + qz cosα. Set to 0 => alpha = atan2(-qz, qy).
+    alpha = jnp.arctan2(-q2[..., 2], q2[..., 1])
+    R3 = rotx(alpha)
+
+    R = jnp.einsum("...ij,...jk->...ik", R3, jnp.einsum("...ij,...jk->...ik", R2, R1))
+    n_std = jnp.einsum("...ij,...Lj->...Li", R, n)
+   
+   # Degeneracies:
+    #  - n_plus ~ 0: cannot define +x direction
+    #  - q2_yz ~ 0: cannot define alpha (q already parallel to x after step 1)
+    
+    #deg1 = jnp.linalg.norm(n_plus, axis=-1) < eps
+    #deg2 = (q2[..., 1]**2 + q2[..., 2]**2) < (eps * eps)
+    #deg = deg1 | deg2
+
+    #I = jnp.eye(3, dtype=n.dtype)
+    #R = jnp.where(deg[..., None, None], I, R)
+    #n_std = jnp.where(deg[..., None, None], n, n_std)
+
+    return n_std
+
 
 def _safe_norm(v, eps=1e-8):
     return jnp.sqrt(jnp.sum(v * v, axis=-1, keepdims=True) + eps)
@@ -191,6 +245,7 @@ def _safe_norm(v, eps=1e-8):
 def _normalize(v, eps=1e-8):
     return v / _safe_norm(v, eps)
 
+@partial(jit, static_argnums=(2))
 def canonicalize_so3_smooth(n, eps=1e-8, k_shifts=(1, 2, 3)):
     """
     Smooth, translation-commuting SO(3) canonicalization (no atan2, no hard branches).
@@ -263,6 +318,7 @@ def canonicalize_so3_smooth(n, eps=1e-8, k_shifts=(1, 2, 3)):
     # Apply to all sites
     n_std = jnp.einsum("...ij,...Lj->...Li", R, n)
     return n_std
+
 
 def _translation_invariant_tilde_y(y, eps=1e-8, axis=-1):
     """
