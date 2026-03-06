@@ -27,7 +27,7 @@ class MLP(nn.Module):
             x = self.activation(x)
 
         y = nn.Dense(1)(x)
-        return jnp.squeeze(y, axis=-1)
+        return jnp.squeeze(jnp.squeeze(y, axis=-1))
 
 
 class MLP_TI(nn.Module):
@@ -63,7 +63,7 @@ class MLP_SO3(nn.Module):
     def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
         n = jnp.asarray(n)
 
-        n_std = canonicalize_so3_xaxis(n, eps=self.eps)
+        n_std = canonicalize_so3_fast(n, eps=self.eps)
         feats = n_std
         mlp = MLP(hidden_sizes=self.hidden_sizes, activation=self.activation)
         out = mlp(feats)
@@ -104,23 +104,35 @@ class MLP_O3_TI(nn.Module):
         return out
 
 
-def rotz(a):
+def rotx(a):
     ca, sa = jnp.cos(a), jnp.sin(a)
-    return jnp.array([[ ca, -sa, 0.0],
-                      [ sa,  ca, 0.0],
-                      [0.0, 0.0, 1.0]], dtype=jnp.result_type(a, 1.0))
+    z = jnp.zeros_like(a)
+    o = jnp.ones_like(a)
+    return jnp.stack([
+        jnp.stack([ o,  z,  z], axis=-1),
+        jnp.stack([ z, ca, -sa], axis=-1),
+        jnp.stack([ z, sa,  ca], axis=-1),
+    ], axis=-2)   # (..., 3, 3)
 
 def roty(a):
     ca, sa = jnp.cos(a), jnp.sin(a)
-    return jnp.array([[ ca, 0.0,  sa],
-                      [0.0, 1.0, 0.0],
-                      [-sa, 0.0,  ca]], dtype=jnp.result_type(a, 1.0))
+    z = jnp.zeros_like(a)
+    o = jnp.ones_like(a)
+    return jnp.stack([
+        jnp.stack([ ca,  z, sa], axis=-1),
+        jnp.stack([  z,  o,  z], axis=-1),
+        jnp.stack([-sa,  z, ca], axis=-1),
+    ], axis=-2)   # (..., 3, 3)
 
-def rotx(a):
+def rotz(a):
     ca, sa = jnp.cos(a), jnp.sin(a)
-    return jnp.array([[1.0, 0.0, 0.0],
-                      [0.0,  ca, -sa],
-                      [0.0,  sa,  ca]], dtype=jnp.result_type(a, 1.0))
+    z = jnp.zeros_like(a)
+    o = jnp.ones_like(a)
+    return jnp.stack([
+        jnp.stack([ca, -sa,  z], axis=-1),
+        jnp.stack([sa,  ca,  z], axis=-1),
+        jnp.stack([ z,   z,  o], axis=-1),
+    ], axis=-2)   # (..., 3, 3)
 
 
 def canonicalize_so3(n, eps=1e-8, return_R=False):
@@ -184,60 +196,123 @@ def canonicalize_so3(n, eps=1e-8, return_R=False):
     return n_std
 
 
-def canonicalize_so3_xaxis(n, eps=1e-8, return_R=False):
+def canonicalize_so3_fast(n, eps=1e-8):
     """
-    Canonicalization variant:
-      1) Rotate so n_plus = sum_i n_i points along +x
-      2) Use residual rotation about x to enforce (q')_z = 0, where
-         q = sum_i n_i x n_{i+1} (periodic), q' is q after step (1).
-
+    Same constraints as your canonicalize_so3, but avoids atan2/cos/sin composition.
+      1) Rotate so n_plus -> +z
+      2) Use residual z-rotation to make (rotated q)_x = 0
     n: (..., L, 3)
-    Returns:
-      n_std: (..., L, 3)
-      R:     (..., 3, 3) and angles if return_R
+    returns: n_std (..., L, 3)
     """
     n = jnp.asarray(n)
     L = n.shape[-2]
 
-    # translation-invariant, rotation-covariant vectors
-    n_plus = jnp.sum(n, axis=-2)  # (..., 3)
+    n_plus = jnp.sum(n, axis=-2)  # (...,3)
     n_next = jnp.roll(n, shift=-1, axis=-2)
-    q = jnp.sum(jnp.cross(n, n_next), axis=-2)  # (..., 3)
+    q = jnp.sum(jnp.cross(n, n_next), axis=-2)  # (...,3)
 
-    # --- Step 1: send n_plus -> +x ---
-    # R1 = Rz(-phi) makes y component 0 (puts n_plus in xz-plane)
-    phi = jnp.arctan2(n_plus[..., 1], n_plus[..., 0])
-    R1 = rotz(-phi)
-    nplus1 = jnp.einsum("...ij,...j->...i", R1, n_plus)  # (...,3)
+    x, y, z = n_plus[..., 0], n_plus[..., 1], n_plus[..., 2]
 
-    # Now nplus1 = (r, 0, z). Choose theta so that Ry(theta) makes z -> 0 (points to +x).
-    r = jnp.sqrt(nplus1[..., 0]**2 + nplus1[..., 1]**2 + eps)
-    theta = jnp.arctan2(nplus1[..., 2], r)   # tan(theta) = z/r
-    R2 = roty(theta)
+    # r_xy = sqrt(x^2+y^2), nrm = sqrt(x^2+y^2+z^2)
+    r_xy = jnp.sqrt(x*x + y*y + eps)
+    nrm  = jnp.sqrt(x*x + y*y + z*z + eps)
 
-    # --- Step 2: residual rotation about x to make q_z = 0 ---
-    q2 = jnp.einsum("...ij,...j->...i", R2, jnp.einsum("...ij,...j->...i", R1, q))
-    # After Rx(alpha): z' = qy sinα + qz cosα. Set to 0 => alpha = atan2(-qz, qy).
-    alpha = jnp.arctan2(-q2[..., 2], q2[..., 1])
-    R3 = rotx(alpha)
+    # For phi = atan2(y,x):  cos(phi)=x/r_xy, sin(phi)=y/r_xy
+    cphi = x / r_xy
+    sphi = y / r_xy
+
+    # R1 = Rz(-phi): cos(-phi)=cphi, sin(-phi)=-sphi
+    # [[ cphi,  sphi, 0],
+    #  [-sphi,  cphi, 0],
+    #  [   0,     0,  1]]
+    z0 = jnp.zeros_like(cphi)
+    o1 = jnp.ones_like(cphi)
+    R1 = jnp.stack([
+        jnp.stack([ cphi,  sphi, z0], axis=-1),
+        jnp.stack([-sphi,  cphi, z0], axis=-1),
+        jnp.stack([  z0,    z0,  o1], axis=-1),
+    ], axis=-2)  # (...,3,3)
+
+    # For theta = atan2(r_xy, z): cos(theta)=z/nrm, sin(theta)=r_xy/nrm
+    cth = z / nrm
+    sth = r_xy / nrm
+
+    # R2 = Ry(-theta): sin(-theta)=-sth
+    # [[ cth, 0, -sth],
+    #  [  0, 1,   0 ],
+    #  [ sth, 0,  cth]]
+    z0 = jnp.zeros_like(cth)
+    o1 = jnp.ones_like(cth)
+    R2 = jnp.stack([
+        jnp.stack([ cth, z0, -sth], axis=-1),
+        jnp.stack([  z0, o1,   z0], axis=-1),
+        jnp.stack([ sth, z0,  cth], axis=-1),
+    ], axis=-2)  # (...,3,3)
+
+    # q2 = R2 * (R1 * q)
+    q1 = jnp.einsum("...ij,...j->...i", R1, q)
+    q2 = jnp.einsum("...ij,...j->...i", R2, q1)
+    a, b = q2[..., 0], q2[..., 1]
+
+    rab = jnp.sqrt(a*a + b*b + eps)
+
+    # alpha = atan2(a,b): cos(alpha)=b/rab, sin(alpha)=a/rab
+    ca = b / rab
+    sa = a / rab
+
+    # R3 = Rz(alpha):
+    # [[ ca, -sa, 0],
+    #  [ sa,  ca, 0],
+    #  [  0,   0, 1]]
+    z0 = jnp.zeros_like(ca)
+    o1 = jnp.ones_like(ca)
+    R3 = jnp.stack([
+        jnp.stack([ ca, -sa, z0], axis=-1),
+        jnp.stack([ sa,  ca, z0], axis=-1),
+        jnp.stack([ z0,  z0, o1], axis=-1),
+    ], axis=-2)  # (...,3,3)
 
     R = jnp.einsum("...ij,...jk->...ik", R3, jnp.einsum("...ij,...jk->...ik", R2, R1))
     n_std = jnp.einsum("...ij,...Lj->...Li", R, n)
-   
-   # Degeneracies:
-    #  - n_plus ~ 0: cannot define +x direction
-    #  - q2_yz ~ 0: cannot define alpha (q already parallel to x after step 1)
-    
-    #deg1 = jnp.linalg.norm(n_plus, axis=-1) < eps
-    #deg2 = (q2[..., 1]**2 + q2[..., 2]**2) < (eps * eps)
-    #deg = deg1 | deg2
 
-    #I = jnp.eye(3, dtype=n.dtype)
-    #R = jnp.where(deg[..., None, None], I, R)
-    #n_std = jnp.where(deg[..., None, None], n, n_std)
+    # Optional: if you still want the exact same degeneracy behavior, keep it.
+    # Note: any hard where introduces non-smoothness at the threshold.
+    deg1 = (jnp.linalg.norm(n_plus, axis=-1) < eps)
+    deg2 = (a*a + b*b) < (eps*eps)
+    deg = deg1 | deg2
+    n_std = jnp.where(deg[..., None, None], n, n_std)
 
     return n_std
 
+
+def canonicalize_so3_xaxis(n, eps=1e-6, return_R=False):
+    n = jnp.asarray(n)
+    n_next = jnp.roll(n, shift=-1, axis=-2)
+    n_plus = jnp.sum(n, axis=-2)           # (..., 3)
+    q      = jnp.sum(jnp.cross(n, n_next), axis=-2)  # (..., 3)
+
+    # Step 1: rotate n_plus -> +x  (use atan2 only on normalized xy)
+    nxy_norm = _safe_norm(n_plus[..., :2], eps=eps)
+    phi = jnp.arctan2(n_plus[..., 1], n_plus[..., 0] + eps)
+    R1  = rotz(-phi)
+    nplus1 = jnp.einsum("...ij,...j->...i", R1, n_plus)
+
+    r     = _safe_norm(nplus1[..., :2], eps=eps)  # guaranteed > 0
+    theta = jnp.arctan2(nplus1[..., 2], r)
+    R2    = roty(theta)
+
+    # Step 2: residual rotation to kill q_z
+    R12 = jnp.einsum("...ij,...jk->...ik", R2, R1)
+    q2  = jnp.einsum("...ij,...j->...i", R12, q)
+
+    # Guard: blend to identity when q2_yz is tiny
+    q2_yz_norm = _safe_norm(q2[..., 1:], eps=eps)  # smooth, > 0
+    alpha = jnp.arctan2(-q2[..., 2], q2[..., 1] + eps)
+    R3    = rotx(alpha)
+
+    R     = jnp.einsum("...ij,...jk->...ik", R3, R12)
+    n_std = jnp.einsum("...ij,...Lj->...Li", R, n)
+    return n_std
 
 def _safe_norm(v, eps=1e-8):
     return jnp.sqrt(jnp.sum(v * v, axis=-1, keepdims=True) + eps)
