@@ -210,7 +210,7 @@ def canonicalize_so3_fast(n, eps=1e-8):
     n_plus = jnp.sum(n, axis=-2)  # (...,3)
 
     signs = jnp.where((jnp.arange(L) % 2) == 0, 1.0, -1.0)
-    q = jnp.sum(n * signs[:, None], axis=0)
+    q = jnp.sum(n * signs[:, None], axis=0) + n_plus
 
     x, y, z = n_plus[..., 0], n_plus[..., 1], n_plus[..., 2]
 
