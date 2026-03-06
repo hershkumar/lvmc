@@ -208,8 +208,9 @@ def canonicalize_so3_fast(n, eps=1e-8):
     L = n.shape[-2]
 
     n_plus = jnp.sum(n, axis=-2)  # (...,3)
-    n_next = jnp.roll(n, shift=-1, axis=-2)
-    q = jnp.sum(jnp.cross(n, n_next), axis=-2)  # (...,3)
+
+    signs = jnp.where((jnp.arange(L) % 2) == 0, 1.0, -1.0)
+    q = jnp.sum(n * signs[:, None], axis=0)
 
     x, y, z = n_plus[..., 0], n_plus[..., 1], n_plus[..., 2]
 
@@ -277,10 +278,10 @@ def canonicalize_so3_fast(n, eps=1e-8):
 
     # Optional: if you still want the exact same degeneracy behavior, keep it.
     # Note: any hard where introduces non-smoothness at the threshold.
-    deg1 = (jnp.linalg.norm(n_plus, axis=-1) < eps)
-    deg2 = (a*a + b*b) < (eps*eps)
-    deg = deg1 | deg2
-    n_std = jnp.where(deg[..., None, None], n, n_std)
+    #deg1 = (jnp.linalg.norm(n_plus, axis=-1) < eps)
+    #deg2 = (a*a + b*b) < (eps*eps)
+    #deg = deg1 | deg2
+    #n_std = jnp.where(deg[..., None, None], n, n_std)
 
     return n_std
 
