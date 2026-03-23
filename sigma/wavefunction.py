@@ -27,24 +27,7 @@ class MLP(nn.Module):
             x = self.activation(x)
 
         y = nn.Dense(1)(x)
-        return jnp.squeeze(y, axis=-1)
-
-
-class MLP_TI(nn.Module):
-    """
-    Translation invariant MLP via gauge fixing of Fourier transform features
-    """
-    hidden_sizes: Sequence[int] = (128, 128)
-    activation: Callable = nn.celu
-    eps: float = 1e-8
-    
-    @nn.compact
-    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
-        n = jnp.asarray(n)
-        feats = translation_invariant_features_real(n, eps=self.eps)
-        mlp = MLP(hidden_sizes=self.hidden_sizes, activation=self.activation)
-        out = mlp(feats)
-        return out
+        return jnp.exp(-jnp.squeeze(y, axis=-1))
 
 
 class MLP_SO3(nn.Module):
@@ -54,7 +37,7 @@ class MLP_SO3(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = jnp.asarray(x)
-        x = canonicalize_so3_fast(x)
+        x = pairwise_dot_products(x)
         x = x.reshape(*x.shape[:-2], -1)
 
         for h in self.hidden_sizes:
@@ -62,42 +45,47 @@ class MLP_SO3(nn.Module):
             x = self.activation(x)
 
         y = nn.Dense(1)(x)
-        return jnp.squeeze(y, axis=-1)
+        return jnp.exp(-jnp.squeeze(y, axis=-1))
 
 
-
-class MLP_O3_TI(nn.Module):
-    """
-    Translation + full O(3) invariant scalar via:
-      SO(3) canonicalize -> translation-invariant Fourier features -> shared MLP
-      then symmetrize over one fixed reflection.
-    """
+class MLP_excited(nn.Module):
     hidden_sizes: Sequence[int] = (128, 128)
     activation: Callable = nn.celu
-    eps: float = 1e-8
 
-    # Avoid mutable default by constructing inside __call__ (or use default_factory).
     @nn.compact
-    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
-        n = jnp.asarray(n)
+    def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
+        x = jnp.asarray(x)
+        n = x
+        x = pairwise_dot_products(x)
+        x = x.reshape(*x.shape[:-2], -1)
 
-        Px = jnp.diag(jnp.array([-1.0,  1.0,  1.0], dtype=n.dtype))
-        Py = jnp.diag(jnp.array([ 1.0, -1.0,  1.0], dtype=n.dtype))
-        Pz = jnp.diag(jnp.array([ 1.0,  1.0, -1.0], dtype=n.dtype))
+        for h in self.hidden_sizes:
+            x = nn.Dense(h)(x)
+            x = self.activation(x)
 
-        n_std = canonicalize_so3(n, eps=self.eps)
-        feats = translation_invariant_features_real(n_std, eps=self.eps)
+        y = nn.Dense(1)(x)
+        return jnp.sum(n, axis=0)[2]*jnp.exp(-jnp.squeeze(y, axis=-1))
 
-        mlp = MLP(hidden_sizes=self.hidden_sizes, activation=self.activation)
-        out0 = mlp(feats)
 
-        def eval_ref(P):
-            n_ref = jnp.einsum("ij,...Lj->...Li", P, n_std)
-            feats_ref = translation_invariant_features_real(n_ref, eps=self.eps)
-            return mlp(feats_ref)
+def pairwise_dot_products(n, idx=False):
+    """
+    Compute all distinct pairwise dot products n[i]·n[j] for 0<=i<j<L.
 
-        out = (out0 + eval_ref(Px) + eval_ref(Py) + eval_ref(Pz)) * 0.25
-        return out
+    Args:
+      n: array of shape (..., L, D)
+
+    Returns:
+      dots: array of shape (..., L*(L-1)//2) in the order of jnp.triu_indices(L, k=1)
+      idx:  tuple (i_idx, j_idx) so dots[..., t] = (n[..., i_idx[t], :] * n[..., j_idx[t], :]).sum(-1)
+    """
+    n = jnp.asarray(n)
+    L = n.shape[-2]
+    i_idx, j_idx = jnp.triu_indices(L, k=1)
+
+    ni = n[..., i_idx, :]  # (..., M, D)
+    nj = n[..., j_idx, :]  # (..., M, D)
+    dots = jnp.sum(ni * nj, axis=-1)  # (..., M)
+    return (dots, (i_idx, j_idx)) if idx else dots
 
 
 def rotx(a):

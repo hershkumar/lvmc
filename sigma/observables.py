@@ -163,66 +163,89 @@ def dE_dparams(model, eta, g, params, configs):
 def _lap_s2_all_sites_cartesian(model, params, xyz):
     """
     xyz: (L,3) assumed ~unit vectors
-    returns sum_i [Δ_{S^2,i} A - |∇_{S^2,i}A|^2]
-    where A = model.apply(params, xyz).
+    returns sum_i [(L_i^2 psi)/psi] with L_i^2 = -Δ_{S^2,i}
+    where psi = model.apply(params, xyz).
+
+    Uses the Cartesian Laplace–Beltrami identity for a function f on S^2
+    extended off-sphere:
+        Δ_{S^2} f = tr(P H) - 2 n·∇f
+    with P = I - n n^T, H the 3x3 Hessian wrt that site's Cartesian coords,
+    and ∇f the 3-gradient wrt that site's coords.
+
+    Then (L^2 f) = -Δ_{S^2} f, so (L^2 psi)/psi = -(Δ_{S^2} psi)/psi.
     """
     xyz = jnp.asarray(xyz)
     L = xyz.shape[0]
 
-    def A_of_xyz(xyz_full):
-        return model.apply(params, xyz_full)
+    def psi_of_xyz(xyz_full):
+        return model.apply(params, xyz_full)  # psi directly (scalar, possibly complex)
+
+    psi_val = psi_of_xyz(xyz)
 
     # Cartesian gradient wrt all xyz: (L,3)
-    g_all = jax.jacrev(A_of_xyz)(xyz)
+    g_all = jax.jacrev(psi_of_xyz)(xyz)
 
     # Hessian-vector product helper: returns (L,3)
     def hvp(v):
-        return jax.jvp(jax.grad(A_of_xyz), (xyz,), (v,))[1]
+        return jax.jvp(jax.grad(psi_of_xyz), (xyz,), (v,))[1]
 
-    # Build basis for all 3L components (flattened)
+    # Full Hessian in flattened coords (3L x 3L)
     basis = jnp.eye(3 * L, dtype=xyz.dtype).reshape(3 * L, L, 3)
     H_rows = jax.vmap(hvp)(basis)           # (3L, L, 3)
-    H_full = H_rows.reshape(3 * L, 3 * L)   # full Hessian in flattened coords
+    H_full = H_rows.reshape(3 * L, 3 * L)   # (3L, 3L)
 
-    # Extract each site's 3x3 block diagonal trace projected to tangent space
-    # We'll do it by forming the 3x3 block for each site from H_full.
     def per_site(i):
         n = xyz[i]              # (3,)
         g = g_all[i]            # (3,)
         P = jnp.eye(3, dtype=xyz.dtype) - jnp.outer(n, n)  # tangent projector
 
-        # 3x3 block for site i in flattened Hessian
         idx = jnp.arange(3) + 3 * i
         Hii = H_full[jnp.ix_(idx, idx)]     # (3,3)
 
-        lap_A = jnp.sum(P * Hii) - 2.0 * jnp.dot(n, g)     # (P:H) - 2 n·g
-        gradA_sq = jnp.dot(g, g) - jnp.dot(n, g) ** 2      # g^T P g
+        # Δ_{S^2} psi at site i:
+        lap_psi = jnp.sum(P * Hii) - 2.0 * jnp.dot(n, g)
 
-        return lap_A - gradA_sq
+        # (L_i^2 psi)/psi = -(Δ_{S^2} psi)/psi
+        return -lap_psi / (psi_val + 1e-300)
 
     return jnp.sum(jax.vmap(per_site)(jnp.arange(L)))
+
 
 @partial(jax.jit, static_argnums=(0,))
 def spherical_laplacian_cartesian_opt(model, params, config_xyz):
     config_xyz = jnp.asarray(config_xyz)
-    # Optional: renormalize to unit length to reduce drift
     config_xyz = config_xyz / (jnp.linalg.norm(config_xyz, axis=-1, keepdims=True) + 1e-12)
     return _lap_s2_all_sites_cartesian(model, params, config_xyz)
 
+
 @partial(jit, static_argnums=(0,))
 def config_energy_opt(model, eta, g, params, config_xyz):
+    """
+    Assumes Hamiltonian kinetic uses sum_i L_i^2, with local kinetic estimator:
+        sum_i (L_i^2 psi)/psi
+    """
     kinetic_term = eta * (g ** 2) * spherical_laplacian_cartesian_opt(model, params, config_xyz)
+
     n = jnp.asarray(config_xyz)
     n_next = jnp.roll(n, shift=-1, axis=0)
     nn = jnp.sum(n * n_next, axis=-1)
     potential_term = -(eta / (g ** 2)) * jnp.sum(nn)
+
     return 0.5 * kinetic_term + potential_term
 
 
 @partial(jit, static_argnums=(0,))
 def dlogpsi_dparams_opt(model, params, config):
-    gradA = jax.grad(lambda p: model.apply(p, config))(params)
-    return jax.tree_util.tree_map(lambda x: -x, gradA)
+    """
+    model.apply returns psi(config) directly.
+    Returns d/dparams [log psi] = (1/psi) dpsi/dparams.
+    """
+    psi_val = model.apply(params, config)
+
+    gradpsi = jax.grad(lambda p: model.apply(p, config))(params)
+    invpsi = 1.0 / (psi_val + 1e-300)
+
+    return jax.tree_util.tree_map(lambda x: x * invpsi, gradpsi)
 
 
 @partial(jit, static_argnums=(0,))
@@ -245,11 +268,9 @@ def _batched_vmap(f, configs, batch_size):
     n_full = (ncfg // batch_size) * batch_size
     remainder = ncfg - n_full
 
-    # Process full batches via lax.map (constant memory per batch)
     full_configs = configs[:n_full].reshape(ncfg // batch_size, batch_size, *configs.shape[1:])
     batched_f = jax.vmap(f)
     full_results = jax.lax.map(batched_f, full_configs)
-    # Flatten leading two dims
     full_results = jax.tree_util.tree_map(
         lambda x: x.reshape(n_full, *x.shape[2:]), full_results
     )
@@ -268,10 +289,8 @@ def dE_dparams_opt(model, eta, g, params, configs, batch_size=None):
     """
     Compute energy gradient over a batch of configurations.
 
-    Args:
-        batch_size: if provided, processes configs in chunks of this size to
-                    limit peak memory. Useful when ncfg is large. Must be a
-                    compile-time static integer (hence static_argnums).
+    Assumes configs are drawn from |psi|^2 and the standard VMC gradient:
+        ∂E = 2( <E_loc O> - <E_loc><O> ),  O = ∂ log psi / ∂params
     """
     local_fn = lambda config: local_terms_opt(model, eta, g, params, config)
     energies, logs = _batched_vmap(local_fn, configs, batch_size)
@@ -296,6 +315,9 @@ def dE_dparams_opt(model, eta, g, params, configs, batch_size=None):
         pytree_mult(-2 * energy, mean_logs)
     )
     return grad, energy, uncert
+
+
+
 
 # ACTIVE IMPLEMENTATION (comment these lines to use originals above)
 spherical_laplacian_cartesian = spherical_laplacian_cartesian_opt
