@@ -157,110 +157,147 @@ def dE_dparams(model, eta, g, params, configs):
 
 
 # ============================================================================
-# Optimized observables implementation (toggleable)
+# Optimized observables implementation (active below)
 # Keep original functions above intact. To revert to originals, comment out the
 # alias assignments in the "ACTIVE IMPLEMENTATION" section below.
-def _lap_s2_all_sites_cartesian(model, params, xyz):
+def _scalar_tiny(x):
+    x = jnp.asarray(x)
+    real_dtype = jnp.real(x).dtype
+    return jnp.asarray(jnp.finfo(real_dtype).tiny, dtype=x.dtype)
+
+
+def _normalize_cartesian_sites(xyz, eps=1e-12):
+    xyz = jnp.asarray(xyz)
+    norm_sq = jnp.sum(xyz * xyz, axis=-1, keepdims=True)
+    inv_norm = lax.rsqrt(jnp.maximum(norm_sq, jnp.asarray(eps, dtype=norm_sq.dtype)))
+    return xyz * inv_norm
+
+
+def _orthonormal_tangent_basis(xyz):
+    xyz = jnp.asarray(xyz)
+    z_axis = jnp.array([0.0, 0.0, 1.0], dtype=xyz.dtype)
+    x_axis = jnp.array([1.0, 0.0, 0.0], dtype=xyz.dtype)
+    helper = jnp.where(jnp.abs(xyz[:, 2:3]) > 0.9, x_axis, z_axis)
+
+    t1 = _normalize_cartesian_sites(jnp.cross(helper, xyz))
+    t2 = _normalize_cartesian_sites(jnp.cross(xyz, t1))
+    return t1, t2
+
+
+def _tree_weighted_sum(tree, weights):
+    return jax.tree_util.tree_map(
+        lambda leaf: jnp.tensordot(weights, leaf, axes=((0,), (0,))),
+        tree,
+    )
+
+
+def _reshape_into_padded_batches(configs, batch_size):
+    ncfg = configs.shape[0]
+    n_batches = (ncfg + batch_size - 1) // batch_size
+    pad = n_batches * batch_size - ncfg
+
+    pad_width = ((0, pad),) + ((0, 0),) * (configs.ndim - 1)
+    padded_configs = jnp.pad(configs, pad_width)
+    batch_shape = (n_batches, batch_size) + configs.shape[1:]
+    batched_configs = padded_configs.reshape(batch_shape)
+
+    mask = jnp.pad(jnp.ones((ncfg,), dtype=configs.dtype), (0, pad))
+    batched_mask = mask.reshape(n_batches, batch_size)
+    return batched_configs, batched_mask
+
+
+def _lap_s2_all_sites_tangent_linearized(model, params, xyz):
     """
-    xyz: (L,3) assumed ~unit vectors
-    returns sum_i [(L_i^2 psi)/psi] with L_i^2 = -Δ_{S^2,i}
-    where psi = model.apply(params, xyz).
+    Evaluate sum_i (L_i^2 psi) / psi using only tangent-space HVPs.
 
-    Uses the Cartesian Laplace–Beltrami identity for a function f on S^2
-    extended off-sphere:
-        Δ_{S^2} f = tr(P H) - 2 n·∇f
-    with P = I - n n^T, H the 3x3 Hessian wrt that site's Cartesian coords,
-    and ∇f the 3-gradient wrt that site's coords.
+    This avoids materializing the full Cartesian Hessian. For each site we
+    build two orthonormal tangent directions e1, e2 and use
 
-    Then (L^2 f) = -Δ_{S^2} f, so (L^2 psi)/psi = -(Δ_{S^2} psi)/psi.
+        tr(P H_i) = e1^T H_i e1 + e2^T H_i e2,
+
+    while the radial correction is -2 n_i · grad_i psi.
     """
     xyz = jnp.asarray(xyz)
     L = xyz.shape[0]
 
     def psi_of_xyz(xyz_full):
-        return model.apply(params, xyz_full)  # psi directly (scalar, possibly complex)
+        return model.apply(params, xyz_full)
 
-    psi_val = psi_of_xyz(xyz)
+    (psi_val, grad_xyz), jvp_fn = jax.linearize(jax.value_and_grad(psi_of_xyz), xyz)
+    t1, t2 = _orthonormal_tangent_basis(xyz)
+    eye = jnp.eye(L, dtype=xyz.dtype)[:, :, None]
 
-    # Cartesian gradient wrt all xyz: (L,3)
-    g_all = jax.jacrev(psi_of_xyz)(xyz)
+    dirs1 = eye * t1[None, :, :]
+    dirs2 = eye * t2[None, :, :]
 
-    # Hessian-vector product helper: returns (L,3)
     def hvp(v):
-        return jax.jvp(jax.grad(psi_of_xyz), (xyz,), (v,))[1]
+        return jvp_fn(v)[1]
 
-    # Full Hessian in flattened coords (3L x 3L)
-    basis = jnp.eye(3 * L, dtype=xyz.dtype).reshape(3 * L, L, 3)
-    H_rows = jax.vmap(hvp)(basis)           # (3L, L, 3)
-    H_full = H_rows.reshape(3 * L, 3 * L)   # (3L, 3L)
+    hvps1 = jax.vmap(hvp)(dirs1)
+    hvps2 = jax.vmap(hvp)(dirs2)
 
-    def per_site(i):
-        n = xyz[i]              # (3,)
-        g = g_all[i]            # (3,)
-        P = jnp.eye(3, dtype=xyz.dtype) - jnp.outer(n, n)  # tangent projector
+    diag_idx = jnp.arange(L)
+    diag_hvps1 = hvps1[diag_idx, diag_idx]
+    diag_hvps2 = hvps2[diag_idx, diag_idx]
 
-        idx = jnp.arange(3) + 3 * i
-        Hii = H_full[jnp.ix_(idx, idx)]     # (3,3)
-
-        # Δ_{S^2} psi at site i:
-        lap_psi = jnp.sum(P * Hii) - 2.0 * jnp.dot(n, g)
-
-        # (L_i^2 psi)/psi = -(Δ_{S^2} psi)/psi
-        return -lap_psi / (psi_val + 1e-300)
-
-    return jnp.sum(jax.vmap(per_site)(jnp.arange(L)))
+    projected_trace = jnp.einsum("ij,ij->i", t1, diag_hvps1) + jnp.einsum(
+        "ij,ij->i", t2, diag_hvps2
+    )
+    radial_correction = 2.0 * jnp.einsum("ij,ij->i", xyz, grad_xyz)
+    lap_psi = projected_trace - radial_correction
+    inv_psi = 1.0 / (psi_val + _scalar_tiny(psi_val))
+    return -jnp.sum(lap_psi) * inv_psi
 
 
 @partial(jax.jit, static_argnums=(0,))
-def spherical_laplacian_cartesian_opt(model, params, config_xyz):
-    config_xyz = jnp.asarray(config_xyz)
-    config_xyz = config_xyz / (jnp.linalg.norm(config_xyz, axis=-1, keepdims=True) + 1e-12)
-    return _lap_s2_all_sites_cartesian(model, params, config_xyz)
+def spherical_laplacian_cartesian_fast(model, params, config_xyz):
+    config_xyz = _normalize_cartesian_sites(config_xyz)
+    return _lap_s2_all_sites_tangent_linearized(model, params, config_xyz)
 
 
 @partial(jit, static_argnums=(0,))
-def config_energy_opt(model, eta, g, params, config_xyz):
-    """
-    Assumes Hamiltonian kinetic uses sum_i L_i^2, with local kinetic estimator:
-        sum_i (L_i^2 psi)/psi
-    """
-    kinetic_term = eta * (g ** 2) * spherical_laplacian_cartesian_opt(model, params, config_xyz)
+def config_energy_fast(model, eta, g, params, config_xyz):
+    kinetic_term = 0.5 * eta * (g**2) * spherical_laplacian_cartesian_fast(
+        model, params, config_xyz
+    )
 
-    n = jnp.asarray(config_xyz)
+    n = _normalize_cartesian_sites(config_xyz)
     n_next = jnp.roll(n, shift=-1, axis=0)
     nn = jnp.sum(n * n_next, axis=-1)
-    potential_term = -(eta / (g ** 2)) * jnp.sum(nn)
+    potential_term = -(eta / (g**2)) * jnp.sum(nn)
 
-    return 0.5 * kinetic_term + potential_term
+    return kinetic_term + potential_term
 
 
 @partial(jit, static_argnums=(0,))
-def dlogpsi_dparams_opt(model, params, config):
+def dlogpsi_dparams_fast(model, params, config):
     """
     model.apply returns psi(config) directly.
-    Returns d/dparams [log psi] = (1/psi) dpsi/dparams.
+    Returns d/dparams [log psi] = (1 / psi) dpsi/dparams.
     """
-    psi_val = model.apply(params, config)
 
-    gradpsi = jax.grad(lambda p: model.apply(p, config))(params)
-    invpsi = 1.0 / (psi_val + 1e-300)
+    def psi_of_params(p):
+        return model.apply(p, config)
 
+    psi_val, gradpsi = jax.value_and_grad(psi_of_params)(params)
+    invpsi = 1.0 / (psi_val + _scalar_tiny(psi_val))
     return jax.tree_util.tree_map(lambda x: x * invpsi, gradpsi)
 
 
 @partial(jit, static_argnums=(0,))
-def local_terms_opt(model, eta, g, params, config):
-    local_energy = config_energy_opt(model, eta, g, params, config)
-    lg = dlogpsi_dparams_opt(model, params, config)
-    return local_energy, lg
+def local_terms_fast(model, eta, g, params, config):
+    local_energy = config_energy_fast(model, eta, g, params, config)
+    log_grad = dlogpsi_dparams_fast(model, params, config)
+    return local_energy, log_grad
+
+
+spherical_laplacian_cartesian_opt = spherical_laplacian_cartesian_fast
+config_energy_opt = config_energy_fast
+dlogpsi_dparams_opt = dlogpsi_dparams_fast
+local_terms_opt = local_terms_fast
 
 
 def _batched_vmap(f, configs, batch_size):
-    """
-    Apply f over configs in chunks of batch_size using lax.map over full
-    batches, handling remainders manually. Falls back to plain vmap if
-    batch_size is None or >= ncfg.
-    """
     ncfg = configs.shape[0]
     if batch_size is None or batch_size >= ncfg:
         return jax.vmap(f)(configs)
@@ -268,9 +305,19 @@ def _batched_vmap(f, configs, batch_size):
     n_full = (ncfg // batch_size) * batch_size
     remainder = ncfg - n_full
 
-    full_configs = configs[:n_full].reshape(ncfg // batch_size, batch_size, *configs.shape[1:])
+    full_configs = configs[:n_full].reshape(
+        ncfg // batch_size, batch_size, *configs.shape[1:]
+    )
+
+    # vmap inside lax.map is fine, but outputs are stacked — reshape correctly
     batched_f = jax.vmap(f)
-    full_results = jax.lax.map(batched_f, full_configs)
+
+    # Use scan instead of lax.map to avoid upfront full allocation
+    def scan_fn(carry, batch):
+        return carry, batched_f(batch)
+
+    _, full_results = jax.lax.scan(scan_fn, None, full_configs)
+
     full_results = jax.tree_util.tree_map(
         lambda x: x.reshape(n_full, *x.shape[2:]), full_results
     )
@@ -292,29 +339,127 @@ def dE_dparams_opt(model, eta, g, params, configs, batch_size=None):
     Assumes configs are drawn from |psi|^2 and the standard VMC gradient:
         ∂E = 2( <E_loc O> - <E_loc><O> ),  O = ∂ log psi / ∂params
     """
-    local_fn = lambda config: local_terms_opt(model, eta, g, params, config)
-    energies, logs = _batched_vmap(local_fn, configs, batch_size)
+    ncfg = configs.shape[0]
+    local_fn = jax.vmap(lambda config: local_terms_opt(model, eta, g, params, config))
 
-    ncfg = energies.shape[0]
-    energy = jnp.mean(energies)
+    if batch_size is None or batch_size >= ncfg:
+        energies, logs = local_fn(configs)
+        count = jnp.asarray(ncfg, dtype=energies.dtype)
+        inv_count = 1.0 / count
+        energy = jnp.sum(energies) * inv_count
+        var = jnp.maximum(
+            jnp.sum(energies * energies) * inv_count - energy * energy,
+            jnp.array(0.0, dtype=energies.dtype),
+        )
+        uncert = jnp.sqrt(var * inv_count)
+        mean_logs = pytree_mult(inv_count, _tree_weighted_sum(logs, jnp.ones_like(energies)))
+        mean_weighted_logs = pytree_mult(inv_count, _tree_weighted_sum(logs, energies))
+        grad = pytree_add(
+            pytree_mult(2.0, mean_weighted_logs),
+            pytree_mult(-2.0 * energy, mean_logs),
+        )
+        return grad, energy, uncert
+
+    effective_batch_size = min(batch_size, ncfg)
+    batched_configs, batched_mask = _reshape_into_padded_batches(
+        configs, effective_batch_size
+    )
+
+    zero_scalar = jnp.array(0.0, dtype=configs.dtype)
+    sum_logs0 = pytree_zeros_like(params)
+    sum_e_logs0 = pytree_zeros_like(params)
+
+    def scan_fn(acc, batch):
+        sum_e, sum_e2, sum_logs, sum_e_logs = acc
+        batch_configs, mask = batch
+        energies, logs = local_fn(batch_configs)
+        weighted_energies = energies * mask
+
+        sum_e = sum_e + jnp.sum(weighted_energies)
+        sum_e2 = sum_e2 + jnp.sum(weighted_energies * energies)
+        sum_logs = pytree_add(sum_logs, _tree_weighted_sum(logs, mask))
+        sum_e_logs = pytree_add(
+            sum_e_logs, _tree_weighted_sum(logs, weighted_energies)
+        )
+        return (sum_e, sum_e2, sum_logs, sum_e_logs), None
+
+    (sum_e, sum_e2, sum_logs, sum_e_logs), _ = jax.lax.scan(
+        scan_fn,
+        (zero_scalar, zero_scalar, sum_logs0, sum_e_logs0),
+        (batched_configs, batched_mask),
+    )
+
+    count = jnp.asarray(ncfg, dtype=sum_e.dtype)
+    inv_count = 1.0 / count
+    energy = sum_e * inv_count
     var = jnp.maximum(
-        jnp.mean(energies * energies) - energy * energy,
-        jnp.array(0.0, dtype=energies.dtype),
+        sum_e2 * inv_count - energy * energy,
+        jnp.array(0.0, dtype=sum_e.dtype),
     )
-    uncert = jnp.sqrt(var / ncfg)
+    uncert = jnp.sqrt(var * inv_count)
 
-    weighted_logs = jax.tree_util.tree_map(
-        lambda x: x * energies.reshape((ncfg,) + (1,) * (x.ndim - 1)),
-        logs,
-    )
-    mean_logs = pytree_mean(logs)
-    mean_weighted_logs = pytree_mean(weighted_logs)
-
+    mean_logs = pytree_mult(inv_count, sum_logs)
+    mean_weighted_logs = pytree_mult(inv_count, sum_e_logs)
     grad = pytree_add(
-        pytree_mult(2, mean_weighted_logs),
-        pytree_mult(-2 * energy, mean_logs)
+        pytree_mult(2.0, mean_weighted_logs),
+        pytree_mult(-2.0 * energy, mean_logs),
     )
     return grad, energy, uncert
+
+
+
+
+@partial(jit, static_argnums=(0, 5))
+def batched_energy(model, eta, g, params, configs, batch_size=None):
+    """
+    Compute energy over a batch of configurations.
+    """
+    ncfg = configs.shape[0]
+    local_fn = jax.vmap(lambda config: config_energy_opt(model, eta, g, params, config))
+
+    if batch_size is None or batch_size >= ncfg:
+        energies = local_fn(configs)
+        count = jnp.asarray(ncfg, dtype=energies.dtype)
+        inv_count = 1.0 / count
+        energy = jnp.sum(energies) * inv_count
+        var = jnp.maximum(
+            jnp.sum(energies * energies) * inv_count - energy * energy,
+            jnp.array(0.0, dtype=energies.dtype),
+        )
+        uncert = jnp.sqrt(var * inv_count)
+        return energy, uncert
+
+    effective_batch_size = min(batch_size, ncfg)
+    batched_configs, batched_mask = _reshape_into_padded_batches(
+        configs, effective_batch_size
+    )
+
+    def scan_fn(acc, batch):
+        sum_e, sum_e2 = acc
+        batch_configs, mask = batch
+        energies = local_fn(batch_configs)
+        weighted_energies = energies * mask
+        sum_e = sum_e + jnp.sum(weighted_energies)
+        sum_e2 = sum_e2 + jnp.sum(weighted_energies * energies)
+        return (sum_e, sum_e2), None
+
+    zero_scalar = jnp.array(0.0, dtype=configs.dtype)
+    (sum_e, sum_e2), _ = jax.lax.scan(
+        scan_fn,
+        (zero_scalar, zero_scalar),
+        (batched_configs, batched_mask),
+    )
+
+    count = jnp.asarray(ncfg, dtype=sum_e.dtype)
+    inv_count = 1.0 / count
+    energy = sum_e * inv_count
+    var = jnp.maximum(
+        sum_e2 * inv_count - energy * energy,
+        jnp.array(0.0, dtype=sum_e.dtype),
+    )
+    uncert = jnp.sqrt(var * inv_count)
+
+    return energy, uncert
 
 
 
