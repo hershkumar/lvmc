@@ -8,14 +8,13 @@ def extract_correlation_length(C, C_uncert, fit_type="exponential"):
     L = len(C)
     extracted = []
     uncerts = []
-    if fit_type == "exponential":
-        def fit_func(n, A, xi):
+    def fit_func(n, A, xi):
+        if fit_type == "exponential":
             return A * (np.exp(-n/xi)/np.sqrt(n) + np.exp(-(L-n)/xi)/np.sqrt(L-n))
-    if fit_type == "bessel":
-        def fit_func(n, A, xi):
+        elif fit_type == "bessel":
             return A * (kn(0, n/xi) + kn(0, (L-n)/xi))
-    else:
-        raise ValueError("Invalid fit type. Must be 'exponential' or 'bessel'.")
+        else:
+            raise ValueError("Invalid fit type. Must be 'exponential' or 'bessel'.")
     for i in range(3, L):
         data = np.arange(1, i)
         C_data = C[1:i]
