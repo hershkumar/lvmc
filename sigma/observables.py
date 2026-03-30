@@ -254,9 +254,53 @@ def spherical_laplacian_cartesian_fast(model, params, config_xyz):
     config_xyz = _normalize_cartesian_sites(config_xyz)
     return _lap_s2_all_sites_tangent_linearized(model, params, config_xyz)
 
+@partial(jax.jit, static_argnums=(0,))
+def isospin_charge(model, params, config_xyz):
+    """
+    Computes total Q_z psi/psi for a configuration of unit vectors on S^2.
+
+    Assumptions:
+      - config_xyz: (L,3) unit vectors n_i = (x_i,y_i,z_i)
+      - model.apply(params, config_xyz) returns psi(config_xyz) (scalar, possibly complex)
+      - Q_z = sum_i L_{z,i}
+      - L_{z} = -i (x ∂_y - y ∂_x) acting on functions of n
+
+    Implementation:
+      - Extend psi off the sphere by normalizing the varied site vector.
+      - For each site i, compute (L_{z,i} psi)/psi and sum.
+    """
+    xyz = jnp.asarray(config_xyz)
+    L = xyz.shape[0]
+
+    def psi_of_xyz(xyz_full):
+        return model.apply(params, xyz_full)
+
+    psi_val = psi_of_xyz(xyz) # avoid division by 0
+
+    def per_site(i):
+        n0 = xyz[i]
+
+        # off-sphere extension via normalization
+        def psi_ext(m):
+            mhat = m / (jnp.linalg.norm(m))
+            cfg2 = xyz.at[i].set(mhat)
+            return psi_of_xyz(cfg2)
+
+        grad = jax.grad(psi_ext)(n0)  # (∂_x psi, ∂_y psi, ∂_z psi)
+
+        x, y = n0[0], n0[1]
+        dpsi_dx, dpsi_dy = grad[0], grad[1]
+
+        # Lz psi = -i (x ∂_y - y ∂_x) psi
+        Lz_psi = -1j * (x * dpsi_dy - y * dpsi_dx)
+
+        return Lz_psi / psi_val
+
+    return jnp.real(jnp.sum(jax.vmap(per_site)(jnp.arange(L))))
+
 
 @partial(jit, static_argnums=(0,))
-def config_energy_fast(model, eta, g, params, config_xyz):
+def config_energy_fast(model, eta, g, mu, params, config_xyz):
     kinetic_term = 0.5 * eta * (g**2) * spherical_laplacian_cartesian_fast(
         model, params, config_xyz
     )
@@ -265,8 +309,10 @@ def config_energy_fast(model, eta, g, params, config_xyz):
     n_next = jnp.roll(n, shift=-1, axis=0)
     nn = jnp.sum(n * n_next, axis=-1)
     potential_term = -(eta / (g**2)) * jnp.sum(nn)
+    chemical_term = -mu*isospin_charge(model, params, config_xyz)
 
-    return kinetic_term + potential_term
+
+    return kinetic_term + potential_term + chemical_term
 
 
 @partial(jit, static_argnums=(0,))
@@ -285,8 +331,8 @@ def dlogpsi_dparams_fast(model, params, config):
 
 
 @partial(jit, static_argnums=(0,))
-def local_terms_fast(model, eta, g, params, config):
-    local_energy = config_energy_fast(model, eta, g, params, config)
+def local_terms_fast(model, eta, g, mu, params, config):
+    local_energy = config_energy_fast(model, eta, g, mu, params, config)
     log_grad = dlogpsi_dparams_fast(model, params, config)
     return local_energy, log_grad
 
@@ -331,8 +377,8 @@ def _batched_vmap(f, configs, batch_size):
     )
 
 
-@partial(jit, static_argnums=(0, 5))
-def dE_dparams_opt(model, eta, g, params, configs, batch_size=None):
+@partial(jit, static_argnums=(0, 6))
+def dE_dparams_opt(model, eta, g, mu, params, configs, batch_size=None):
     """
     Compute energy gradient over a batch of configurations.
 
@@ -340,7 +386,7 @@ def dE_dparams_opt(model, eta, g, params, configs, batch_size=None):
         ∂E = 2( <E_loc O> - <E_loc><O> ),  O = ∂ log psi / ∂params
     """
     ncfg = configs.shape[0]
-    local_fn = jax.vmap(lambda config: local_terms_opt(model, eta, g, params, config))
+    local_fn = jax.vmap(lambda config: local_terms_opt(model, eta, g, mu, params, config))
 
     if batch_size is None or batch_size >= ncfg:
         energies, logs = local_fn(configs)
@@ -409,13 +455,13 @@ def dE_dparams_opt(model, eta, g, params, configs, batch_size=None):
 
 
 
-@partial(jit, static_argnums=(0, 5))
-def batched_energy(model, eta, g, params, configs, batch_size=None):
+@partial(jit, static_argnums=(0, 6))
+def batched_energy(model, eta, g, mu, params, configs, batch_size=None):
     """
     Compute energy over a batch of configurations.
     """
     ncfg = configs.shape[0]
-    local_fn = jax.vmap(lambda config: config_energy_opt(model, eta, g, params, config))
+    local_fn = jax.vmap(lambda config: config_energy_opt(model, eta, g, mu, params, config))
 
     if batch_size is None or batch_size >= ncfg:
         energies = local_fn(configs)
@@ -581,8 +627,8 @@ def clip_local_energies(energies, n_mad=5.0):
     return jnp.clip(energies, median - n_mad * mad, median + n_mad * mad)
 
 
-@partial(jit, static_argnums=(0, 5))
-def sr_stats(model, eta, g_coup, params, configs, batch_size=None):
+@partial(jit, static_argnums=(0, 6))
+def sr_stats(model, eta, g_coup, mu, params, configs, batch_size=None):
     """
     Compute energy, gradient, and centred log-derivatives for SR.
 
@@ -592,7 +638,7 @@ def sr_stats(model, eta, g_coup, params, configs, batch_size=None):
         E:              scalar  mean local energy (unclipped, for monitoring).
         uncert:         scalar  standard error of the mean energy (unclipped).
     """
-    local_fn = lambda config: local_terms_opt(model, eta, g_coup, params, config)
+    local_fn = lambda config: local_terms_opt(model, eta, g_coup, mu, params, config)
     energies, logs = _batched_vmap(local_fn, configs, batch_size)
 
     N = energies.shape[0]

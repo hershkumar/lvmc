@@ -26,7 +26,7 @@ example_MC_options = {
 }
 
 
-def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None, batch_size=None, clip_threshold=None):
+def train(results, model, eta, g, mu, sampler, MC_options, steps, lr, fig=None, batch_size=None, clip_threshold=None):
     """
     Args:
         results: tuple of initial params, energies, and uncertainties (e.g. from a previous training run or from a pretraining step). If starting fresh, pass (init_params, [], []) where init_params are the initial parameters of the model.
@@ -90,7 +90,7 @@ def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None, batc
         # loop over training steps
         for step_num in pbar:
 
-            grads, energy, uncert = step(params, model, eta, g, sampler, MC_options, batch_size)
+            grads, energy, uncert = step(params, model, eta, g, mu, sampler, MC_options, batch_size)
             # print(energy)
             # print(grads)
             
@@ -109,7 +109,7 @@ def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None, batc
     else:
         prev_samples = MC_options['pos_initials']
         for step_num in pbar:
-            comp, prev_samples = step_chain(params, model, eta, g, sampler, MC_options, prev_samples, batch_size=batch_size)
+            comp, prev_samples = step_chain(params, model, eta, g, mu, sampler, MC_options, prev_samples, batch_size=batch_size)
             grads, energy, uncert = comp
             
             pbar.set_description(f"Energy Density = {energy/sampler.shape[0]}", refresh=True)
@@ -124,7 +124,7 @@ def train(results, model, eta, g, sampler, MC_options, steps, lr, fig=None, batc
     return params, avg_energies, avg_uncerts
 
 
-def step_chain(params, model, eta, g, sampler, MC_options, prev_samples, batch_size=None):
+def step_chain(params, model, eta, g, mu, sampler, MC_options, prev_samples, batch_size=None):
     nchains = MC_options["nchains"]
     Nsweeps = MC_options["num_samples"] // nchains
 
@@ -146,9 +146,9 @@ def step_chain(params, model, eta, g, sampler, MC_options, prev_samples, batch_s
     # samples is chain-major flattened: (nchains*Nsweeps, N, 3)
     last_pos = samples.reshape((nchains, Nsweeps) + sampler.shape)[:, -1]  # (nchains, N, 3)
 
-    return dE_dparams(model, eta, g, params, samples, batch_size=batch_size), last_pos
+    return dE_dparams(model, eta, g, mu, params, samples, batch_size=batch_size), last_pos
 
-def step(params, model, eta, g, sampler, MC_options, batch_size=None):
+def step(params, model, eta, g, mu, sampler, MC_options, batch_size=None):
     """
     Performs a single training step: samples configurations, computes the loss, and updates the model parameters.
     """
@@ -163,7 +163,7 @@ def step(params, model, eta, g, sampler, MC_options, batch_size=None):
         MC_options["seeds"],
     )
 
-    return dE_dparams(model, eta, g, params, samples, batch_size=batch_size)
+    return dE_dparams(model, eta, g, mu, params, samples, batch_size=batch_size)
 
 
 # =============
@@ -201,7 +201,7 @@ def step(params, model, eta, g, sampler, MC_options, batch_size=None):
 #     new_params = jax.tree_util.tree_map(lambda p, d: p - lr * d, params, delta)
 #     return new_params, E, uncert, info
 
-def sr_step(model, eta, g_coup, params, configs, lr,
+def sr_step(model, eta, g_coup, mu, params, configs, lr,
             damping=1e-3, cg_tol=1e-6, cg_maxiter=200,
             clip_threshold=1.0, batch_size=None):
     """
@@ -213,7 +213,7 @@ def sr_step(model, eta, g_coup, params, configs, lr,
     clip_threshold: maximum L2 norm of the update delta. Set to None to disable.
     """
     grad, logs_centered, E, uncert = sr_stats(
-        model, eta, g_coup, params, configs, batch_size
+        model, eta, g_coup, mu, params, configs, batch_size
     )
 
     def matvec(v):
@@ -244,7 +244,7 @@ def damping_schedule(step, damping_init=0.1, damping_final=1e-3, decay=0.05):
     return damping_final + (damping_init - damping_final) * np.exp(-decay * step)
 
 
-def sr_train(results, model, eta, g, sampler, MC_options, steps, lr,
+def sr_train(results, model, eta, g, mu, sampler, MC_options, steps, lr,
              damping_init=0.1, damping_final=1e-3, damping_decay=0.05,
              fig=None, batch_size=None):
     """
@@ -300,7 +300,7 @@ def sr_train(results, model, eta, g, sampler, MC_options, steps, lr,
                 MC_options["seeds"],
             )
             params, energy, uncert, info = sr_step(
-                model, eta, g, params, samples, lr, damping=damping, clip_threshold=1.0
+                model, eta, g, mu, params, samples, lr, damping=damping, clip_threshold=1.0
             )
             
             pbar.set_description(
@@ -329,7 +329,7 @@ def sr_train(results, model, eta, g, sampler, MC_options, steps, lr,
                 MC_options["seeds"],
             )
             params, energy, uncert, info = sr_step(
-                model, eta, g, params, samples, lr, damping=damping,clip_threshold=1.0, batch_size=batch_size
+                model, eta, g, mu, params, samples, lr, damping=damping,clip_threshold=1.0, batch_size=batch_size
             )
             
             pbar.set_description(
@@ -350,7 +350,7 @@ def sr_train(results, model, eta, g, sampler, MC_options, steps, lr,
 
 
 
-def train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
+def train_adapt(results, model, eta, g, mu, sampler, MC_options, steps, lr,
                 target_accept=0.50, adapt_rate=0.05,
                 fig=None, batch_size=None, clip_threshold=None):
     """
@@ -447,7 +447,7 @@ def train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
             var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
             var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
 
-            grads, energy, uncert = dE_dparams(model, eta, g, params, samples,
+            grads, energy, uncert = dE_dparams(model, eta, g, mu, params, samples,
                                                batch_size=batch_size)
 
             pbar.set_description(
@@ -483,7 +483,7 @@ def train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
             var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
             var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
 
-            grads, energy, uncert = dE_dparams(model, eta, g, params, samples,
+            grads, energy, uncert = dE_dparams(model, eta, g, mu, params, samples,
                                                batch_size=batch_size)
 
             pbar.set_description(
@@ -515,7 +515,7 @@ def train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
 
 
 
-def sr_train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
+def sr_train_adapt(results, model, eta, g, mu, sampler, MC_options, steps, lr,
                    damping_init=0.1, damping_final=1e-3, damping_decay=0.05,
                    target_accept=0.50, adapt_rate=0.05,
                    fig=None, batch_size=None):
@@ -603,7 +603,7 @@ def sr_train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
             var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
 
             params, energy, uncert, info = sr_step(
-                model, eta, g, params, samples, lr,
+                model, eta, g, mu, params, samples, lr,
                 damping=damping, clip_threshold=1.0, batch_size=batch_size,
             )
 
@@ -642,7 +642,7 @@ def sr_train_adapt(results, model, eta, g, sampler, MC_options, steps, lr,
             var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
 
             params, energy, uncert, info = sr_step(
-                model, eta, g, params, samples, lr,
+                model, eta, g, mu, params, samples, lr,
                 damping=damping, clip_threshold=1.0, batch_size=batch_size,
             )
 
