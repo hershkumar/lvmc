@@ -296,7 +296,7 @@ def isospin_charge(model, params, config_xyz):
 
         return Lz_psi / psi_val
 
-    return jnp.real(jnp.sum(jax.vmap(per_site)(jnp.arange(L))))
+    return jnp.imag(jnp.sum(jax.vmap(per_site)(jnp.arange(L))))
 
 
 @partial(jit, static_argnums=(0,))
@@ -454,7 +454,6 @@ def dE_dparams_opt(model, eta, g, mu, params, configs, batch_size=None):
 
 
 
-
 @partial(jit, static_argnums=(0, 6))
 def batched_energy(model, eta, g, mu, params, configs, batch_size=None):
     """
@@ -484,9 +483,12 @@ def batched_energy(model, eta, g, mu, params, configs, batch_size=None):
         sum_e, sum_e2 = acc
         batch_configs, mask = batch
         energies = local_fn(batch_configs)
-        weighted_energies = energies * mask
-        sum_e = sum_e + jnp.sum(weighted_energies)
-        sum_e2 = sum_e2 + jnp.sum(weighted_energies * energies)
+
+        masked_energies = jnp.where(mask, energies, 0.0)
+        masked_e2 = jnp.where(mask, energies * energies, 0.0)
+
+        sum_e = sum_e + jnp.sum(masked_energies)
+        sum_e2 = sum_e2 + jnp.sum(masked_e2)
         return (sum_e, sum_e2), None
 
     zero_scalar = jnp.array(0.0, dtype=configs.dtype)
@@ -506,7 +508,6 @@ def batched_energy(model, eta, g, mu, params, configs, batch_size=None):
     uncert = jnp.sqrt(var * inv_count)
 
     return energy, uncert
-
 
 
 
@@ -551,11 +552,81 @@ def Cr(configs):
 
 
 @jit
+def _corr_all_r_fft(configs):
+    """
+    configs: (N, L, d)
+    returns: (N, L)
+    """
+    fk = jnp.fft.rfft(configs, axis=1)                  # (N, Lf, d)
+    power = jnp.sum(jnp.abs(fk) ** 2, axis=-1)         # (N, Lf)
+    corr = jnp.fft.irfft(power, n=configs.shape[1], axis=1) / configs.shape[1]
+    return corr
+
+
+@partial(jit, static_argnums=(1,))
+def Cr_with_cov_optimized(configs, batch_size=1024):
+    """
+    Returns
+    -------
+    C : (L,)
+        Mean correlator
+    cov : (L, L)
+        Covariance matrix of the mean correlator
+    uncerts : (L,)
+        sqrt(diag(cov))
+    """
+    N, L, d = configs.shape
+    if N < 2:
+        raise ValueError("Need at least two configurations to estimate covariance.")
+
+    # Use a stable accumulation dtype
+    acc_dtype = jnp.float64 if jnp.issubdtype(configs.dtype, jnp.floating) else jnp.float64
+
+    nbatch = (N + batch_size - 1) // batch_size
+    padded_N = nbatch * batch_size
+    pad = padded_N - N
+
+    configs_pad = jnp.pad(configs, ((0, pad), (0, 0), (0, 0)))
+    mask = (jnp.arange(padded_N) < N).reshape(nbatch, batch_size)
+
+    batched_configs = configs_pad.reshape(nbatch, batch_size, L, d)
+
+    def scan_fn(carry, xs):
+        sum_corr, sum_outer = carry
+        batch_configs, batch_mask = xs
+
+        corr_batch = _corr_all_r_fft(batch_configs).astype(acc_dtype)   # (B, L)
+
+        w = batch_mask.astype(acc_dtype)
+        corr_batch = corr_batch * w[:, None]
+
+        sum_corr = sum_corr + jnp.sum(corr_batch, axis=0)               # (L,)
+        sum_outer = sum_outer + corr_batch.T @ corr_batch               # (L, L)
+
+        return (sum_corr, sum_outer), None
+
+    init = (
+        jnp.zeros((L,), dtype=acc_dtype),
+        jnp.zeros((L, L), dtype=acc_dtype),
+    )
+
+    (sum_corr, sum_outer), _ = lax.scan(scan_fn, init, (batched_configs, mask))
+
+    Nf = jnp.asarray(N, dtype=acc_dtype)
+    C = sum_corr / Nf
+
+    centered_sum_outer = sum_outer - Nf * jnp.outer(C, C)
+    denom = Nf * (Nf - jnp.asarray(1, dtype=acc_dtype))
+    cov = centered_sum_outer / denom
+
+    cov = 0.5 * (cov + cov.T)
+    uncerts = jnp.sqrt(jnp.clip(jnp.diag(cov), a_min=0.0))
+
+    return C, cov, uncerts
+
+@jit
 def nx(configs):
     return jnp.mean(configs, axis=0)
-
-
-
 
 
 
