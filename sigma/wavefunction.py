@@ -55,17 +55,20 @@ class MLP_excited(nn.Module):
     @nn.compact
     def __call__(self, x: jnp.ndarray) -> jnp.ndarray:
         x = jnp.asarray(x)
-        n = x
-        x = pairwise_dot_products(x)
-        x = x.reshape(*x.shape[:-2], -1)
+        n = x                                    # (..., N, 3)
 
-        for h in self.hidden_sizes:
-            x = nn.Dense(h)(x)
-            x = self.activation(x)
+        g = pairwise_dot_products(x)             # (..., N, N)
+        h = g.reshape(*g.shape[:-2], -1)         # (..., N*N)
 
-        y = nn.Dense(1)(x)
-        return jnp.sum(n, axis=0)[2]*jnp.exp(-jnp.squeeze(y, axis=-1))
+        for w in self.hidden_sizes:
+            h = nn.Dense(w)(h)
+            h = self.activation(h)
 
+        y = nn.Dense(1)(h)
+        psi0_like = jnp.exp(-jnp.squeeze(y, axis=-1))   # scalar envelope
+
+        Oz = jnp.sum(n, axis=-2)[..., 2]                # sum over sites, take z-component
+        return Oz * psi0_like
 
 def pairwise_dot_products(n, idx=False):
     """
