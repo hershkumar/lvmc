@@ -208,14 +208,14 @@ def _reshape_into_padded_batches(configs, batch_size):
 
 def _lap_s2_all_sites_tangent_linearized(model, params, xyz):
     """
-    Evaluate sum_i (L_i^2 psi) / psi using only tangent-space HVPs.
+    Optimized: O(L) memory (no (L,L,3) direction tensors, no (L,L,3) HVP storage).
 
-    This avoids materializing the full Cartesian Hessian. For each site we
-    build two orthonormal tangent directions e1, e2 and use
+    Computes:
+      sum_i (L_i^2 psi)/psi = - (sum_i Δ_{S^2,i} psi) / psi
+    using tangent-space HVPs at each site.
 
-        tr(P H_i) = e1^T H_i e1 + e2^T H_i e2,
-
-    while the radial correction is -2 n_i · grad_i psi.
+    For each site i and tangent basis e1,e2:
+      Δ_{S^2,i} psi = e1^T H_i e1 + e2^T H_i e2 - 2 n_i · (∇_i psi)
     """
     xyz = jnp.asarray(xyz)
     L = xyz.shape[0]
@@ -223,36 +223,44 @@ def _lap_s2_all_sites_tangent_linearized(model, params, xyz):
     def psi_of_xyz(xyz_full):
         return model.apply(params, xyz_full)
 
+    # One linearization at xyz: gives psi_val and grad_xyz, and a fast JVP closure.
     (psi_val, grad_xyz), jvp_fn = jax.linearize(jax.value_and_grad(psi_of_xyz), xyz)
-    t1, t2 = _orthonormal_tangent_basis(xyz)
-    eye = jnp.eye(L, dtype=xyz.dtype)[:, :, None]
 
-    dirs1 = eye * t1[None, :, :]
-    dirs2 = eye * t2[None, :, :]
+    t1, t2 = _orthonormal_tangent_basis(xyz)  # (L,3), (L,3)
 
-    def hvp(v):
-        return jvp_fn(v)[1]
+    # Radial correction summed over sites: 2 * sum_i n_i · grad_i psi
+    radial_sum = 2.0 * jnp.sum(jnp.sum(xyz * grad_xyz, axis=-1))
 
-    hvps1 = jax.vmap(hvp)(dirs1)
-    hvps2 = jax.vmap(hvp)(dirs2)
+    # Accumulate projected trace sum_i [e1^T H_i e1 + e2^T H_i e2] without storing hvps.
+    def body(i, acc):
+        # Build a direction v that is zero everywhere except at site i.
+        v = jnp.zeros_like(xyz).at[i].set(t1[i])
+        hvp1 = jvp_fn(v)[1]            # (L,3)
+        acc = acc + jnp.dot(t1[i], hvp1[i])
 
-    diag_idx = jnp.arange(L)
-    diag_hvps1 = hvps1[diag_idx, diag_idx]
-    diag_hvps2 = hvps2[diag_idx, diag_idx]
+        v = jnp.zeros_like(xyz).at[i].set(t2[i])
+        hvp2 = jvp_fn(v)[1]            # (L,3)
+        acc = acc + jnp.dot(t2[i], hvp2[i])
 
-    projected_trace = jnp.einsum("ij,ij->i", t1, diag_hvps1) + jnp.einsum(
-        "ij,ij->i", t2, diag_hvps2
+        return acc
+
+    proj_trace_sum = lax.fori_loop(
+        0, L, body, jnp.array(0.0, dtype=jnp.result_type(xyz, psi_val))
     )
-    radial_correction = 2.0 * jnp.einsum("ij,ij->i", xyz, grad_xyz)
-    lap_psi = projected_trace - radial_correction
+
+    # Sum_i Δ_i psi
+    lap_sum = proj_trace_sum - radial_sum
+
     inv_psi = 1.0 / (psi_val + _scalar_tiny(psi_val))
-    return -jnp.sum(lap_psi) * inv_psi
+    # Return sum_i (L_i^2 psi)/psi = -(sum_i Δ_i psi)/psi
+    return -lap_sum * inv_psi
 
 
 @partial(jax.jit, static_argnums=(0,))
 def spherical_laplacian_cartesian_fast(model, params, config_xyz):
     config_xyz = _normalize_cartesian_sites(config_xyz)
     return _lap_s2_all_sites_tangent_linearized(model, params, config_xyz)
+
 
 @partial(jax.jit, static_argnums=(0,))
 def isospin_charge(model, params, config_xyz):
