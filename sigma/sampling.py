@@ -403,27 +403,24 @@ class ClusterSampler:
         if self.shape[-1] != 3:
             raise ValueError(f"Expected last dim = 3, got {self.shape}")
         N = self.shape[0]
-        # 1D periodic neighbor list — shape (N, 2)
         self.neighbors = jnp.stack(
             [jnp.arange(N, dtype=jnp.int32) - 1,
              (jnp.arange(N, dtype=jnp.int32) + 1) % N],
             axis=-1,
         )
-        # fix wrap for site 0
         self.neighbors = self.neighbors.at[0, 0].set(N - 1)
 
-    # ── cluster building via BFS in a while_loop ────────────────────────
     def _build_cluster(self, key, projections, beta_embed, seed_site):
         N = projections.shape[0]
-        neighbors = self.neighbors          # (N, 2)
+        neighbors = self.neighbors
         n_nbr = neighbors.shape[1]
 
         in_cluster = jnp.zeros(N, dtype=jnp.bool_)
         stack = jnp.zeros(N, dtype=jnp.int32)
         in_cluster = in_cluster.at[seed_site].set(True)
         stack = stack.at[0].set(seed_site)
-        pp = jnp.int32(0)                  # process pointer
-        ss = jnp.int32(1)                  # stack size
+        pp = jnp.int32(0)
+        ss = jnp.int32(1)
 
         def cond_fn(state):
             _, _, pp, ss, _ = state
@@ -463,48 +460,69 @@ class ClusterSampler:
         )
         return in_cluster, key
 
-    # ── single cluster step + Metropolis accept/reject on |ψ|² ──────────
+    def _boundary_delta_E(self, pos, prop, in_cluster):
+        """
+        Compute delta_E = E(prop) - E(old) using only boundary bonds.
+
+        A boundary bond is one where exactly one site is in the cluster.
+        For bond (i, j) with i in cluster and j outside:
+            delta_E contribution = -(prop_i . pos_j) + (pos_i . pos_j)
+                                 = -(prop_i - pos_i) . pos_j
+        """
+        neighbors = self.neighbors  # (N, 2)
+        # for each site i, check each neighbor j
+        # boundary bond: in_cluster[i] XOR in_cluster[j]
+        # only count bonds where i is IN cluster and j is OUT
+        # to avoid double counting
+        ic = in_cluster                          # (N,)
+        nb = neighbors                           # (N, 2)
+        ic_nb = ic[nb]                           # (N, 2)
+
+        # mask: site i in cluster, neighbor j out of cluster
+        boundary = ic[:, None] & (~ic_nb)        # (N, 2)
+
+        # delta per bond: -(prop_i - pos_i) . pos_j
+        diff = prop - pos                        # (N, 3)
+        pos_nb = pos[nb]                         # (N, 2, 3)
+        # dot product of diff[i] with pos_nb[i, k]
+        dot = jnp.sum(diff[:, None, :] * pos_nb, axis=-1)  # (N, 2)
+
+        delta_E = -jnp.sum(dot * boundary)
+        return delta_E
+
     def _cluster_step_rng(self, log_psi_fn, carry, beta_embed):
         key, pos, log_pos, acc = carry
         N = pos.shape[0]
 
         key, k_r, k_site = random.split(key, 3)
 
-        # random reflection plane
         r = normalize(random.normal(k_r, shape=(3,), dtype=pos.dtype))
-
-        # random seed site
         seed = random.randint(k_site, shape=(), minval=0, maxval=N)
 
-        # projections onto r
-        projections = pos @ r                       # (N,)
+        projections = pos @ r
 
-        # build Wolff cluster
         in_cluster, key = self._build_cluster(key, projections, beta_embed, seed)
 
-        # reflect cluster spins: n_i → n_i − 2(n_i·r)r
         reflected = pos - 2.0 * projections[:, None] * r[None, :]
         prop = jnp.where(in_cluster[:, None], reflected, pos)
         prop = project_to_sphere(prop)
 
-        # Metropolis accept/reject for the residual |ψ|² weight
+        # energy change from boundary bonds only
+        delta_E = self._boundary_delta_E(pos, prop, in_cluster)
+
         key, k_u = random.split(key)
         log_new = log_psi_fn(prop)
         log_u = jnp.log(random.uniform(k_u, shape=(), dtype=pos.dtype))
-        accept = log_u <= 2.0 * (log_new - log_pos)
+        log_accept = 2.0 * (log_new - log_pos) + beta_embed * delta_E
+        accept = log_u <= log_accept
 
         pos = lax.select(accept, prop, pos)
         log_pos = lax.select(accept, log_new, log_pos)
         acc = acc + accept.astype(acc.dtype)
         return (key, pos, log_pos, acc)
 
-    # ── run_chain: drop-in replacement ──────────────────────────────────
     @partial(jax.jit, static_argnums=(0, 2, 3, 4))
     def run_chain(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initial, seed):
-        """
-        stepsize is reinterpreted as beta_embed (embedding coupling).
-        Larger values → bigger clusters.
-        """
         pos = project_to_sphere(jnp.asarray(pos_initial))
         beta_embed = jnp.asarray(stepsize, dtype=pos.dtype)
         key = random.PRNGKey(seed)
@@ -515,7 +533,6 @@ class ClusterSampler:
         log_pos = log_psi_fn(pos)
         acc0 = jnp.array(0, dtype=jnp.int32)
 
-        # --- thermalization ---
         def therm_body(carry, _):
             return self._cluster_step_rng(log_psi_fn, carry, beta_embed), None
 
@@ -523,7 +540,6 @@ class ClusterSampler:
             therm_body, (key, pos, log_pos, acc0), xs=None, length=Ntherm
         )
 
-        # --- sampling: `keep` cluster steps per sweep, record once ---
         def one_sweep(carry, _):
             key, pos, log_pos, acc = carry
 
@@ -560,3 +576,4 @@ class ClusterSampler:
         samples = samples_per_chain.reshape((nchains * Nsweeps,) + self.shape)
         acc_rate = acc_rates.mean()
         return samples, acc_rate
+
