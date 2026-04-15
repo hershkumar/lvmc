@@ -121,151 +121,132 @@ def rotz(a):
         jnp.stack([ z,   z,  o], axis=-1),
     ], axis=-2)   # (..., 3, 3)
 
-class GramPeriodicNet(nn.Module):
+
+def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
     """
-    Neural network acting on a set of L three-vectors n_i through their Gram matrix
-        g_ij = n_i · n_j
+    n: (..., L, 3)
+    returns: (..., L, L) with G_ij = n_i · n_j
+    """
+    return jnp.einsum("...id,...jd->...ij", n, n)
+
+
+def remove_diagonal(g: jnp.ndarray) -> jnp.ndarray:
+    """
+    Zero the diagonal of the Gram matrix.
+    g: (..., L, L)
+    """
+    L = g.shape[-1]
+    eye = jnp.eye(L, dtype=g.dtype)
+    return g * (1.0 - eye)
+
+
+def cyclic_diagonal_sums(x: jnp.ndarray) -> jnp.ndarray:
+    """
+    Read out translation-invariant features by separation:
+      c_r = sum_i x_{i, i+r mod L}
+
+    x: (..., C, L, L)
+    returns: (..., C, L)
+    """
+    L = x.shape[-1]
+    feats = []
+    for r in range(L):
+        xr = jnp.roll(x, shift=-r, axis=-1)
+        diag = jnp.diagonal(xr, axis1=-2, axis2=-1)  # (..., C, L)
+        feats.append(jnp.sum(diag, axis=-1))          # (..., C)
+    return jnp.stack(feats, axis=-1)                  # (..., C, L)
+
+
+class GodSlayer(nn.Module):
+    """
+    O(3)- and translation-invariant wavefunction on a set of L 3-vectors.
 
     Architecture:
-      - Build Gram matrix g of shape (..., L, L)
-      - Replicate into N_C channels
-      - For each layer l:
-            x -> activation(
-                    W[l,c,0] * x
-                  + sum_{d=1}^{N_N} W[l,c,d] * (
-                        shift_j(+d) + shift_j(-d)
-                      + shift_i(+d) + shift_i(-d)
-                    )
-                  + b[l,c]
-                )
-      - At the end, sum over i,j and over channels
-      - Apply final_activation if provided
+      1) Compute Gram matrix G_ij = n_i · n_j
+      2) Remove diagonal G_ii
+      3) For each channel and each layer:
+           y = W_self * x + sum_d W_nbr[d] * neighbor_shifts(x)
+           x <- x + act(y)     (residual)
+           x <- symmetrize(x)
+      4) Read out cyclic diagonal sums by separation r
+      5) Flatten and pass through a small MLP head
+      6) Return psi = exp(-head)
 
-    Parameters
-    ----------
-    num_layers : int
-        Number of layers N_L.
-    num_neighbors : int
-        Number of neighbor distances N_N to couple.
-        For example:
-          N_N = 1 -> nearest neighbors
-          N_N = 2 -> nearest + next-nearest
-    num_channels : int
-        Number of channels N_C.
-    activation : callable
-        Hidden-layer activation, default nn.celu.
-    final_activation : callable or None
-        Activation applied after the final scalar sum.
-        If None, no final activation is applied.
-    use_bias : bool
-        Whether to include a scalar bias per (layer, channel).
-    param_dtype : dtype
-        Parameter dtype.
+    This keeps parameter count small while building in:
+      - O(3) invariance via Gram matrix
+      - translation invariance via PBC shifts and separation-based readout
     """
-    num_layers: int
-    num_neighbors: int
-    num_channels: int = 1
+    n_layers: int
+    n_neighbors: int = 1
+    n_channels: int = 1
+    hidden_sizes: Sequence[int] = (64,)
     activation: Callable = nn.celu
-    final_activation: Optional[Callable] = None
-    use_bias: bool = False
-    param_dtype = jnp.float32
+    dtype: jnp.dtype = jnp.float32
 
-    @staticmethod
-    def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute Gram matrix g_ij = n_i · n_j.
-
-        Parameters
-        ----------
-        n : array, shape (..., L, 3)
-
-        Returns
-        -------
-        g : array, shape (..., L, L)
-        """
-        return jnp.einsum("...ia,...ja->...ij", n, n)
-
-    def setup(self) -> None:
-        # weights[layer, channel, 0]     = onsite/self coupling
-        # weights[layer, channel, d]     = coupling to distance d, d = 1..num_neighbors
-        self.weights = self.param(
-            "weights",
-            nn.initializers.lecun_normal(),
-            (self.num_layers, self.num_channels, self.num_neighbors + 1),
-            self.param_dtype,
-        )
-
-        if self.use_bias:
-            self.bias = self.param(
-                "bias",
-                nn.initializers.zeros,
-                (self.num_layers, self.num_channels),
-                self.param_dtype,
-            )
-
-    def _neighbor_sum(self, x: jnp.ndarray, d: int) -> jnp.ndarray:
-        """
-        Sum periodic shifts by distance d along both matrix axes.
-
-        Parameters
-        ----------
-        x : array, shape (..., C, L, L)
-        d : int
-
-        Returns
-        -------
-        out : array, shape (..., C, L, L)
-        """
-        return (
-            jnp.roll(x, shift=+d, axis=-1) +  # j -> j+d
-            jnp.roll(x, shift=-d, axis=-1) +  # j -> j-d
-            jnp.roll(x, shift=+d, axis=-2) +  # i -> i+d
-            jnp.roll(x, shift=-d, axis=-2)    # i -> i-d
-        )
-
+    @nn.compact
     def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
-        """
-        Parameters
-        ----------
-        n : array, shape (..., L, 3)
-
-        Returns
-        -------
-        out : array, shape (...)
-            Scalar output per batch element.
-        """
+        n = jnp.asarray(n, dtype=self.dtype)
         if n.shape[-1] != 3:
             raise ValueError(f"Expected input shape (..., L, 3), got {n.shape}")
 
-        # Gram matrix: (..., L, L)
-        g = self.gram_matrix(n)
-        g = g * (1.0 - jnp.eye(g.shape[-1], dtype=g.dtype))
+        g = gram_matrix(n)              # (..., L, L)
+        g = remove_diagonal(g)          # (..., L, L)
+        L = g.shape[-1]
 
-        # Replicate across channels: (..., C, L, L)
-        x = jnp.broadcast_to(
-            g[..., None, :, :],
-            g.shape[:-2] + (self.num_channels,) + g.shape[-2:]
+        w_self = self.param(
+            "w_self",
+            lambda key, shape: jnp.ones(shape, dtype=self.dtype),
+            (self.n_channels, self.n_layers),
+        )
+        w_nbr = self.param(
+            "w_nbr",
+            lambda key, shape: 0.1 * jnp.ones(shape, dtype=self.dtype),
+            (self.n_channels, self.n_layers, self.n_neighbors),
         )
 
-        # Hidden layers
-        for layer in range(self.num_layers):
-            y = self.weights[layer, :, 0][..., None, None] * x
+        # (..., C, L, L)
+        x = jnp.broadcast_to(
+            g[..., None, :, :],
+            g.shape[:-2] + (self.n_channels,) + g.shape[-2:],
+        )
 
-            for d in range(1, self.num_neighbors + 1):
-                y = y + self.weights[layer, :, d][..., None, None] * self._neighbor_sum(x, d)
+        for ell in range(self.n_layers):
+            y = w_self[:, ell][None, :, None, None] * x
 
-            if self.use_bias:
-                y = y + self.bias[layer, :][..., None, None]
+            for d in range(1, self.n_neighbors + 1):
+                s = (
+                    jnp.roll(x, shift=+d, axis=-1) +
+                    jnp.roll(x, shift=-d, axis=-1) +
+                    jnp.roll(x, shift=+d, axis=-2) +
+                    jnp.roll(x, shift=-d, axis=-2)
+                )
+                y = y + w_nbr[:, ell, d - 1][None, :, None, None] * s
 
-            x = self.activation(y)
+            # residual update
+            x = x + self.activation(y)
 
-        # Sum over matrix indices and channels
-        out = jnp.sum(x, axis=(-1, -2, -3))/n.shape[-2]**2.
+            # explicit symmetrization
+            x = 0.5 * (x + jnp.swapaxes(x, -1, -2))
 
-        if self.final_activation is not None:
-            out = self.final_activation(out)
+            # keep diagonal removed
+            eye = jnp.eye(L, dtype=x.dtype)
+            x = x * (1.0 - eye)[None, None, :, :]
 
-        return jnp.exp(-out)
+        # (..., C, L)
+        sep_features = cyclic_diagonal_sums(x)
+
+        # flatten channels and separations: (..., C*L)
+        h = sep_features.reshape(*sep_features.shape[:-2], -1)
+
+        for width in self.hidden_sizes:
+            h = nn.Dense(width)(h)
+            h = self.activation(h)
+
+        y = nn.Dense(1)(h)
+        y = jnp.squeeze(y, axis=-1)
+
+        return jnp.exp(-y)
+
 
 def canonicalize_so3_fast(n, eps=1e-15):
     """
