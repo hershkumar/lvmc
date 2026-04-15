@@ -248,6 +248,110 @@ class GodSlayer(nn.Module):
         return jnp.exp(-y)
 
 
+class GodSlayer2(nn.Module):
+    num_layers: int
+    num_neighbors: int
+    num_channels: int = 1
+    activation: Callable = nn.celu
+    final_activation: Optional[Callable] = None
+    use_bias: bool = False
+    param_dtype: Any = jnp.float32
+
+    @staticmethod
+    def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
+        return jnp.einsum("...ia,...ja->...ij", n, n)
+
+    def setup(self) -> None:
+        self.weights = self.param(
+            "weights",
+            nn.initializers.lecun_normal(),
+            (self.num_layers, self.num_channels, self.num_neighbors + 1),
+            self.param_dtype,
+        )
+        if self.use_bias:
+            self.bias = self.param(
+                "bias",
+                nn.initializers.zeros,
+                (self.num_layers, self.num_channels),
+                self.param_dtype,
+            )
+
+    def _all_neighbor_sums(self, x: jnp.ndarray) -> jnp.ndarray:
+        """
+        Compute neighbor sums for all distances 1..N_N in one batched operation.
+
+        Instead of looping over d and calling roll 4 times each, we:
+          1. Stack all shift amounts into a single array
+          2. vmap a single pair of rolls over that array
+          3. Sum i and j shifts together
+
+        Parameters
+        ----------
+        x : (..., C, L, L)
+
+        Returns
+        -------
+        out : (N_N, ..., C, L, L)
+            out[d-1] = neighbor sum at distance d
+        """
+        shifts = jnp.arange(1, self.num_neighbors + 1)  # (N_N,)
+
+        def single_distance_sum(d):
+            return (
+                jnp.roll(x, d,  axis=-1) +
+                jnp.roll(x, -d, axis=-1) +
+                jnp.roll(x, d,  axis=-2) +
+                jnp.roll(x, -d, axis=-2)
+            )
+
+        # vmap over distances — compiles as a single batched gather rather than N_N separate ops
+        return jax.vmap(single_distance_sum)(shifts)  # (N_N, ..., C, L, L)
+
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        if n.shape[-1] != 3:
+            raise ValueError(f"Expected (..., L, 3), got {n.shape}")
+
+        L = n.shape[-2]
+
+        # Gram matrix, diagonal zeroed: (..., L, L)
+        g = self.gram_matrix(n)
+        g = g * (1.0 - jnp.eye(L, dtype=g.dtype))
+        g = (g + g.mT) * 0.5 # symmetrize to let XLA do better
+        # Expand to channels without broadcast copy: (..., C, L, L)
+        # Tile via einsum — gives XLA a clean contraction to fuse downstream
+        x = jnp.repeat(g[..., None, :, :], self.num_channels, axis=-3)
+
+        # Python loop — let XLA unroll and fuse across all layers
+        for layer in range(self.num_layers):
+            w = self.weights[layer]          # (C, N_N+1)
+            w_self   = w[:, 0]               # (C,)
+            w_neigh  = w[:, 1:]              # (C, N_N)
+
+            # Onsite term
+            y = x * w_self[..., None, None]  # (..., C, L, L)
+
+            if self.num_neighbors > 0:
+                # All neighbor sums at once: (N_N, ..., C, L, L)
+                ns = self._all_neighbor_sums(x)
+
+                # Contract over neighbor distances in one einsum:
+                #   w_neigh: (C, N_N)  ->  broadcast as (N_N, ..., C, 1, 1)
+                # This fuses the weighted sum over d into a single matmul-like op
+                y = y + jnp.einsum("d...cij,cd->...cij", ns, w_neigh)
+
+            if self.use_bias:
+                y = y + self.bias[layer][:, None, None]
+
+            x = self.activation(y)
+
+        out = jnp.sum(x, axis=(-1, -2, -3)) / (L * L)
+
+        if self.final_activation is not None:
+            out = self.final_activation(out)
+
+        return jnp.exp(-out)
+
+
 def canonicalize_so3_fast(n, eps=1e-15):
     """
     Same constraints as your canonicalize_so3, but avoids atan2/cos/sin composition.
