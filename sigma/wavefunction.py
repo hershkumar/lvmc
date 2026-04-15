@@ -255,7 +255,7 @@ class GodSlayer2(nn.Module):
     activation: Callable = nn.celu
     final_activation: Optional[Callable] = None
     use_bias: bool = False
-    param_dtype: Any = jnp.float32
+    param_dtype: jnp.dtype = jnp.float32
 
     @staticmethod
     def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
