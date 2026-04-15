@@ -265,7 +265,7 @@ class GramPeriodicNet(nn.Module):
         if self.final_activation is not None:
             out = self.final_activation(out)
 
-        return out
+        return jnp.exp(-out)
 
 def canonicalize_so3_fast(n, eps=1e-15):
     """
