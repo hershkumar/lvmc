@@ -121,7 +121,151 @@ def rotz(a):
         jnp.stack([ z,   z,  o], axis=-1),
     ], axis=-2)   # (..., 3, 3)
 
+class GramPeriodicNet(nn.Module):
+    """
+    Neural network acting on a set of L three-vectors n_i through their Gram matrix
+        g_ij = n_i · n_j
 
+    Architecture:
+      - Build Gram matrix g of shape (..., L, L)
+      - Replicate into N_C channels
+      - For each layer l:
+            x -> activation(
+                    W[l,c,0] * x
+                  + sum_{d=1}^{N_N} W[l,c,d] * (
+                        shift_j(+d) + shift_j(-d)
+                      + shift_i(+d) + shift_i(-d)
+                    )
+                  + b[l,c]
+                )
+      - At the end, sum over i,j and over channels
+      - Apply final_activation if provided
+
+    Parameters
+    ----------
+    num_layers : int
+        Number of layers N_L.
+    num_neighbors : int
+        Number of neighbor distances N_N to couple.
+        For example:
+          N_N = 1 -> nearest neighbors
+          N_N = 2 -> nearest + next-nearest
+    num_channels : int
+        Number of channels N_C.
+    activation : callable
+        Hidden-layer activation, default nn.celu.
+    final_activation : callable or None
+        Activation applied after the final scalar sum.
+        If None, no final activation is applied.
+    use_bias : bool
+        Whether to include a scalar bias per (layer, channel).
+    param_dtype : dtype
+        Parameter dtype.
+    """
+    num_layers: int
+    num_neighbors: int
+    num_channels: int = 1
+    activation: Callable = nn.celu
+    final_activation: Optional[Callable] = None
+    use_bias: bool = False
+    param_dtype = jnp.float32
+
+    @staticmethod
+    def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
+        """
+        Compute Gram matrix g_ij = n_i · n_j.
+
+        Parameters
+        ----------
+        n : array, shape (..., L, 3)
+
+        Returns
+        -------
+        g : array, shape (..., L, L)
+        """
+        return jnp.einsum("...ia,...ja->...ij", n, n)
+
+    def setup(self) -> None:
+        # weights[layer, channel, 0]     = onsite/self coupling
+        # weights[layer, channel, d]     = coupling to distance d, d = 1..num_neighbors
+        self.weights = self.param(
+            "weights",
+            nn.initializers.lecun_normal(),
+            (self.num_layers, self.num_channels, self.num_neighbors + 1),
+            self.param_dtype,
+        )
+
+        if self.use_bias:
+            self.bias = self.param(
+                "bias",
+                nn.initializers.zeros,
+                (self.num_layers, self.num_channels),
+                self.param_dtype,
+            )
+
+    def _neighbor_sum(self, x: jnp.ndarray, d: int) -> jnp.ndarray:
+        """
+        Sum periodic shifts by distance d along both matrix axes.
+
+        Parameters
+        ----------
+        x : array, shape (..., C, L, L)
+        d : int
+
+        Returns
+        -------
+        out : array, shape (..., C, L, L)
+        """
+        return (
+            jnp.roll(x, shift=+d, axis=-1) +  # j -> j+d
+            jnp.roll(x, shift=-d, axis=-1) +  # j -> j-d
+            jnp.roll(x, shift=+d, axis=-2) +  # i -> i+d
+            jnp.roll(x, shift=-d, axis=-2)    # i -> i-d
+        )
+
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        """
+        Parameters
+        ----------
+        n : array, shape (..., L, 3)
+
+        Returns
+        -------
+        out : array, shape (...)
+            Scalar output per batch element.
+        """
+        if n.shape[-1] != 3:
+            raise ValueError(f"Expected input shape (..., L, 3), got {n.shape}")
+
+        # Gram matrix: (..., L, L)
+        g = self.gram_matrix(n)
+        g = g * (1.0 - jnp.eye(g.shape[-1], dtype=g.dtype))
+
+        # Replicate across channels: (..., C, L, L)
+        x = jnp.broadcast_to(
+            g[..., None, :, :],
+            g.shape[:-2] + (self.num_channels,) + g.shape[-2:]
+        )
+
+        # Hidden layers
+        for layer in range(self.num_layers):
+            y = self.weights[layer, :, 0][..., None, None] * x
+
+            for d in range(1, self.num_neighbors + 1):
+                y = y + self.weights[layer, :, d][..., None, None] * self._neighbor_sum(x, d)
+
+            if self.use_bias:
+                y = y + self.bias[layer, :][..., None, None]
+
+            x = self.activation(y)
+
+        # Sum over matrix indices and channels
+        out = jnp.sum(x, axis=(-1, -2, -3))/n.shape[-2]**2.
+
+        if self.final_activation is not None:
+            out = self.final_activation(out)
+
+        return out
 
 def canonicalize_so3_fast(n, eps=1e-15):
     """
