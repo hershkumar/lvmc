@@ -251,89 +251,73 @@ class GodSlayer(nn.Module):
         return jnp.exp(-y)
 
 
-# ============================================================
-# Activation
-# ============================================================
 def _celu(x: jnp.ndarray, alpha: float = 1.0) -> jnp.ndarray:
     xa = x / alpha
     neg = alpha * jnp.expm1(jnp.minimum(xa, 0.0))
     return jnp.maximum(x, 0.0) + neg
 
 
-def _celu_prime(x: jnp.ndarray, alpha: float = 1.0) -> jnp.ndarray:
-    xa = x / alpha
-    return jnp.where(x > 0, jnp.ones_like(x), jnp.exp(jnp.minimum(xa, 0.0)))
-
-def _build_kernel(w: jnp.ndarray, num_neighbors: int) -> jnp.ndarray:
+def _build_kernel_hwio(w: jnp.ndarray, num_neighbors: int) -> jnp.ndarray:
     """
-    w: (C, Nn+1)  — col 0 is w_self, cols 1: are w_neigh
-    returns: (C, 1, K, K) depthwise conv kernel
+    w: (C, Nn+1)
+    returns: (K, K, 1, C) for depthwise NHWC/HWIO conv
     """
-    C  = w.shape[0]
+    C = w.shape[0]
     Nn = num_neighbors
-    K  = 2 * Nn + 1
-    mid = Nn  # center index
+    K = 2 * Nn + 1
+    mid = Nn
 
-    # Start from zeros, scatter in the weights
-    k = jnp.zeros((C, K, K), dtype=w.dtype)
+    k = jnp.zeros((K, K, C), dtype=w.dtype)
+    k = k.at[mid, mid, :].set(w[:, 0])
 
-    # Self weight at center
-    k = k.at[:, mid, mid].set(w[:, 0])
-
-    # Neighbor weights — symmetric cross pattern
     for d in range(1, Nn + 1):
-        v = w[:, d]                          # (C,)
-        k = k.at[:, mid,     mid + d].set(v) # right
-        k = k.at[:, mid,     mid - d].set(v) # left
-        k = k.at[:, mid + d, mid    ].set(v) # down
-        k = k.at[:, mid - d, mid    ].set(v) # up
+        v = w[:, d]
+        k = k.at[mid, mid + d, :].set(v)
+        k = k.at[mid, mid - d, :].set(v)
+        k = k.at[mid + d, mid, :].set(v)
+        k = k.at[mid - d, mid, :].set(v)
 
-    return k[:, None, :, :]  # (C, 1, K, K) for depthwise
+    return k[:, :, None, :]  # (K, K, 1, C)
 
 
-def _apply_layer(
-    x: jnp.ndarray,       # (..., C, L, L)
-    w: jnp.ndarray,       # (C, Nn+1)
+def _apply_layer_nhwc(
+    x: jnp.ndarray,      # (..., L, L, C)
+    w: jnp.ndarray,      # (C, Nn+1)
     num_neighbors: int,
 ) -> jnp.ndarray:
-    C = x.shape[-3]
-    L = x.shape[-1]
+    L = x.shape[-3]
+    C = x.shape[-1]
     batch_shape = x.shape[:-3]
 
-    kernel = _build_kernel(w, num_neighbors)   # (C, 1, K, K)
-    x_flat = x.reshape(-1, C, L, L)            # (B, C, L, L)
+    kernel = _build_kernel_hwio(w, num_neighbors)  # (K, K, 1, C)
+
+    x_flat = x.reshape((-1, L, L, C))  # (B, H, W, C)
 
     p = num_neighbors
     x_pad = jnp.pad(
         x_flat,
-        ((0, 0), (0, 0), (p, p), (p, p)),
+        ((0, 0), (p, p), (p, p), (0, 0)),
         mode="wrap",
     )
 
     y = lax.conv_general_dilated(
-        x_pad,
-        kernel,
+        lhs=x_pad,
+        rhs=kernel,
         window_strides=(1, 1),
         padding="VALID",
         feature_group_count=C,
-        dimension_numbers=("NCHW", "OIHW", "NCHW"),
+        dimension_numbers=("NHWC", "HWIO", "NHWC"),
     )
 
-    return y.reshape(batch_shape + (C, L, L))
+    return y.reshape(batch_shape + (L, L, C))
 
 
-
-# ============================================================
-# Fused residual stack with one custom VJP
-# ============================================================
-
-def make_godslayer2_fused_stack(num_neighbors: int):
-
+def make_godslayer2_fused_stack_nhwc(num_neighbors: int):
     def fused_stack(x0, weights, residual_scale):
         s = jnp.asarray(residual_scale, dtype=x0.dtype)
 
         def layer_forward(x_in, w):
-            y     = _apply_layer(x_in, w, num_neighbors)
+            y = _apply_layer_nhwc(x_in, w, num_neighbors)
             x_out = x_in + s * _celu(y)
             return x_out, None
 
@@ -342,24 +326,23 @@ def make_godslayer2_fused_stack(num_neighbors: int):
 
     return fused_stack
 
-# ============================================================
-# Module
-# ============================================================
 
 class GodSlayer2(nn.Module):
-    num_layers:     int            = 1
-    num_neighbors:  int            = 1
-    num_channels:   int            = 1
-    activation:     Callable       = nn.celu
-    param_dtype:    jnp.dtype      = jnp.float32
-    residual_scale: float          = 1.0
+    num_layers: int = 1
+    num_neighbors: int = 1
+    num_channels: int = 1
+    param_dtype: jnp.dtype = jnp.float32
+    residual_scale: float = 1.0
 
     @staticmethod
     def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
         return jnp.einsum("...ia,...ja->...ij", n, n)
 
     @staticmethod
-    def godslayer_laplacian_init(num_layers, num_neighbors, self_val=-0.15, neigh_val=0.04, noise=0.01):
+    def godslayer_laplacian_init(
+        num_layers, num_neighbors,
+        self_val=-0.15, neigh_val=0.04, noise=0.01
+    ):
         def init(key, shape, dtype=jnp.float32):
             L, C, K = shape
             depth = jnp.sqrt(float(num_layers))
@@ -373,34 +356,36 @@ class GodSlayer2(nn.Module):
             return w
         return init
 
-    def setup(self) -> None:
+    def setup(self):
         self.weights = self.param(
             "weights",
             self.godslayer_laplacian_init(self.num_layers, self.num_neighbors),
             (self.num_layers, self.num_channels, self.num_neighbors + 1),
             self.param_dtype,
         )
-        # Lift closure creation out of __call__ so it isn't re-traced each forward pass.
-        self._fused_stack = make_godslayer2_fused_stack(self.num_neighbors)
+        self._fused_stack = make_godslayer2_fused_stack_nhwc(self.num_neighbors)
 
     def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
         if n.shape[-1] != 3:
             raise ValueError(f"Expected (..., L, 3), got {n.shape}")
 
-        L     = n.shape[-2]
+        L = n.shape[-2]
         dtype = self.param_dtype
 
-        g   = self.gram_matrix(n).astype(dtype)
-        eye = jnp.eye(L, dtype=dtype)
-        g   = g * (1.0 - eye)
+        g = self.gram_matrix(n).astype(dtype)
+        g = g * (1.0 - jnp.eye(L, dtype=dtype))
 
+        # (..., L, L, C)
         x0 = jnp.broadcast_to(
-            g[..., None, :, :],
-            g.shape[:-2] + (self.num_channels, L, L),
+            g[..., :, :, None],
+            g.shape[:-2] + (L, L, self.num_channels),
         )
 
-        s = jnp.asarray(self.residual_scale, dtype=dtype)
-        x = self._fused_stack(x0, self.weights, s)
+        x = self._fused_stack(
+            x0,
+            self.weights,
+            jnp.asarray(self.residual_scale, dtype=dtype),
+        )
 
         out = jnp.mean(x, axis=(-1, -2, -3))
         return jnp.exp(-out)
