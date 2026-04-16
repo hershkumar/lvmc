@@ -2,6 +2,7 @@ import optax
 from jax import numpy as jnp
 import numpy as np
 from observables import * 
+from observables import _batched_vmap
 from tqdm import trange
 
 # =============
@@ -665,3 +666,187 @@ def sr_train_adapt(results, model, eta, g, mu, sampler, MC_options, steps, lr,
             )[:, -1]
 
     return params, avg_energies, avg_uncerts
+
+
+
+def make_data_mesh():
+    devices = np.array(jax.local_devices())
+    if devices.size < 2:
+        raise ValueError(f"Need at least 2 local devices, got {devices.size}: {devices}")
+    return Mesh(devices, axis_names=("data",))
+
+
+def train_adapt_shard(
+    results,
+    model,
+    eta,
+    g,
+    mu,
+    sampler,
+    MC_options,
+    steps,
+    lr,
+    target_accept=0.50,
+    adapt_rate=0.05,
+    fig=None,
+    batch_size=None,
+    clip_threshold=None,
+    mesh=None,
+):
+    """
+    Sharded variant of train_adapt.
+
+    Differences from train_adapt:
+      - params are replicated across the mesh
+      - sampled configs are sharded across the leading axis ("data")
+      - gradient / energy / uncertainty are computed by a sharded kernel
+
+    Requires:
+      - make_dE_dparams_sharded(model, eta, g, mu, mesh, batch_size=batch_size)
+        to already exist
+    """
+    if mesh is None:
+        mesh = make_data_mesh()
+
+    replicated = NamedSharding(mesh, P())
+    configs_sharding = NamedSharding(mesh, P("data", None, None))
+
+    # Build the sharded inner kernel once.
+    dE_dparams_sharded = make_dE_dparams_sharded(
+        model, eta, g, mu, mesh, batch_size=batch_size
+    )
+
+    params = jax.device_put(results[0], replicated)
+
+    if clip_threshold is not None:
+        tx = optax.chain(
+            optax.clip_by_global_norm(clip_threshold),
+            optax.adam(lr),
+        )
+    else:
+        tx = optax.adam(lr)
+
+    opt_state = tx.init(params)
+    step_nums = list(np.arange(len(results[1])))
+    avg_energies = results[1]
+    avg_uncerts = results[2]
+
+    # Work with a local copy of var so caller's dict is unchanged.
+    var_rad = float(MC_options["var"])
+
+    def push_point(fig, step, e, s):
+        # convert device arrays to host scalars for plotting history
+        e_host = float(jax.device_get(e))
+        s_host = float(jax.device_get(s))
+
+        step_nums.append(step)
+        avg_energies.append(e_host)
+        avg_uncerts.append(s_host)
+
+        steps_arr = jnp.asarray(step_nums)
+        E_arr = jnp.asarray(avg_energies)
+        sig_arr = jnp.asarray(avg_uncerts)
+
+        with fig.batch_update():
+            fig.data[0].x = steps_arr
+            fig.data[0].y = E_arr
+            fig.data[1].x = steps_arr
+            fig.data[1].y = E_arr + sig_arr
+            fig.data[2].x = steps_arr
+            fig.data[2].y = E_arr - sig_arr
+
+    prev_max_step = step_nums[-1] if step_nums else 0
+    pbar = trange(steps, desc="", leave=True)
+
+    if not MC_options["chain"]:
+        for step_num in pbar:
+            # sampler likely expects host/local params; replicate -> host view is fine
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                MC_options["pos_initials"],
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            # shard samples over leading axis
+            samples = jax.device_put(samples, configs_sharding)
+
+            grads, energy, uncert = dE_dparams_sharded(params, samples)
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, prev_max_step + step_num, energy, uncert)
+            else:
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+            updates, opt_state = tx.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+
+    else:
+        prev_samples = MC_options["pos_initials"]
+
+        for step_num in pbar:
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                prev_samples,
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            # chain continuation update happens on host/local samples before sharding
+            prev_samples = samples.reshape(
+                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
+                + sampler.shape
+            )[:, -1]
+
+            samples = jax.device_put(samples, configs_sharding)
+
+            grads, energy, uncert = dE_dparams_sharded(params, samples)
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, prev_max_step + step_num, energy, uncert)
+            else:
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+            updates, opt_state = tx.update(grads, opt_state, params)
+            params = optax.apply_updates(params, updates)
+
+    return params, avg_energies, avg_uncerts
+

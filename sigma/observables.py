@@ -321,6 +321,212 @@ def batched_energy(model, eta, g, mu, params, configs, batch_size=None):
 
 
 
+
+from jax.experimental import shard_map
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+
+# ------------------------------------------------------------
+# Mesh setup
+# ------------------------------------------------------------
+
+def make_data_mesh():
+    devices = np.array(jax.local_devices())
+    if devices.size < 2:
+        raise ValueError(f"Need at least 2 local devices, got {devices.size}: {devices}")
+    return Mesh(devices, axis_names=("data",))
+
+
+# ------------------------------------------------------------
+# Local per-shard accumulation helpers
+# ------------------------------------------------------------
+
+def _dE_stats_local(model, eta, g, mu, params, configs, batch_size=None):
+    """
+    Per-device accumulation over a LOCAL shard of configs.
+    Returns sums, not final averages.
+
+    configs: local shard, shape (n_local, ...)
+    """
+    ncfg = configs.shape[0]
+    local_fn = jax.vmap(lambda config: local_terms_opt(model, eta, g, mu, params, config))
+
+    if batch_size is None or batch_size >= ncfg:
+        energies, logs = local_fn(configs)
+
+        sum_e = jnp.sum(energies)
+        sum_e2 = jnp.sum(energies * energies)
+        count = jnp.asarray(ncfg, dtype=energies.dtype)
+
+        sum_logs = _tree_weighted_sum(logs, jnp.ones_like(energies))
+        sum_e_logs = _tree_weighted_sum(logs, energies)
+        return sum_e, sum_e2, count, sum_logs, sum_e_logs
+
+    effective_batch_size = min(batch_size, ncfg)
+    batched_configs, batched_mask = _reshape_into_padded_batches(configs, effective_batch_size)
+
+    zero_scalar = jnp.array(0.0, dtype=configs.dtype)
+    sum_logs0 = pytree_zeros_like(params)
+    sum_e_logs0 = pytree_zeros_like(params)
+
+    def scan_fn(acc, batch):
+        sum_e, sum_e2, count, sum_logs, sum_e_logs = acc
+        batch_configs, mask = batch
+
+        energies, logs = local_fn(batch_configs)
+        weighted_energies = energies * mask
+
+        sum_e = sum_e + jnp.sum(weighted_energies)
+        sum_e2 = sum_e2 + jnp.sum(weighted_energies * energies)
+        count = count + jnp.sum(mask)
+
+        sum_logs = pytree_add(sum_logs, _tree_weighted_sum(logs, mask))
+        sum_e_logs = pytree_add(sum_e_logs, _tree_weighted_sum(logs, weighted_energies))
+        return (sum_e, sum_e2, count, sum_logs, sum_e_logs), None
+
+    (sum_e, sum_e2, count, sum_logs, sum_e_logs), _ = jax.lax.scan(
+        scan_fn,
+        (zero_scalar, zero_scalar, zero_scalar, sum_logs0, sum_e_logs0),
+        (batched_configs, batched_mask),
+    )
+
+    return sum_e, sum_e2, count, sum_logs, sum_e_logs
+
+
+def _energy_stats_local(model, eta, g, mu, params, configs, batch_size=None):
+    """
+    Per-device accumulation over a LOCAL shard of configs.
+    Returns sums, not final averages.
+    """
+    ncfg = configs.shape[0]
+    local_fn = jax.vmap(lambda config: config_energy_opt(model, eta, g, mu, params, config))
+
+    if batch_size is None or batch_size >= ncfg:
+        energies = local_fn(configs)
+        sum_e = jnp.sum(energies)
+        sum_e2 = jnp.sum(energies * energies)
+        count = jnp.asarray(ncfg, dtype=energies.dtype)
+        return sum_e, sum_e2, count
+
+    effective_batch_size = min(batch_size, ncfg)
+    batched_configs, batched_mask = _reshape_into_padded_batches(configs, effective_batch_size)
+
+    zero_scalar = jnp.array(0.0, dtype=configs.dtype)
+
+    def scan_fn(acc, batch):
+        sum_e, sum_e2, count = acc
+        batch_configs, mask = batch
+        energies = local_fn(batch_configs)
+
+        masked_energies = energies * mask
+        sum_e = sum_e + jnp.sum(masked_energies)
+        sum_e2 = sum_e2 + jnp.sum(masked_energies * energies)
+        count = count + jnp.sum(mask)
+        return (sum_e, sum_e2, count), None
+
+    (sum_e, sum_e2, count), _ = jax.lax.scan(
+        scan_fn,
+        (zero_scalar, zero_scalar, zero_scalar),
+        (batched_configs, batched_mask),
+    )
+
+    return sum_e, sum_e2, count
+
+
+# ------------------------------------------------------------
+# Global reduction helpers
+# ------------------------------------------------------------
+
+def _finalize_dE_from_global_sums(sum_e, sum_e2, count, sum_logs, sum_e_logs):
+    inv_count = 1.0 / count
+    energy = sum_e * inv_count
+    var = jnp.maximum(sum_e2 * inv_count - energy * energy, jnp.array(0.0, dtype=sum_e.dtype))
+    uncert = jnp.sqrt(var * inv_count)
+
+    mean_logs = pytree_mult(inv_count, sum_logs)
+    mean_weighted_logs = pytree_mult(inv_count, sum_e_logs)
+    grad = pytree_add(
+        pytree_mult(2.0, mean_weighted_logs),
+        pytree_mult(-2.0 * energy, mean_logs),
+    )
+    return grad, energy, uncert
+
+
+def _finalize_energy_from_global_sums(sum_e, sum_e2, count):
+    inv_count = 1.0 / count
+    energy = sum_e * inv_count
+    var = jnp.maximum(sum_e2 * inv_count - energy * energy, jnp.array(0.0, dtype=sum_e.dtype))
+    uncert = jnp.sqrt(var * inv_count)
+    return energy, uncert
+
+
+# ------------------------------------------------------------
+# shard_map kernels
+# ------------------------------------------------------------
+
+def make_dE_dparams_sharded(model, eta, g, mu, mesh, batch_size=None):
+    """
+    Returns a sharded function:
+        grad, energy, uncert = fn(params, configs_sharded)
+
+    params: replicated
+    configs_sharded: sharded on leading axis across mesh axis 'data'
+    """
+
+    @partial(
+        shard_map.shard_map,
+        mesh=mesh,
+        in_specs=(P(), P("data", None, None)),
+        out_specs=(P(), P(), P()),
+        check_rep=False,
+    )
+    def _kernel(params, configs):
+        sum_e, sum_e2, count, sum_logs, sum_e_logs = _dE_stats_local(
+            model, eta, g, mu, params, configs, batch_size=batch_size
+        )
+
+        sum_e = lax.psum(sum_e, "data")
+        sum_e2 = lax.psum(sum_e2, "data")
+        count = lax.psum(count, "data")
+        sum_logs = jax.tree_util.tree_map(lambda x: lax.psum(x, "data"), sum_logs)
+        sum_e_logs = jax.tree_util.tree_map(lambda x: lax.psum(x, "data"), sum_e_logs)
+
+        return _finalize_dE_from_global_sums(sum_e, sum_e2, count, sum_logs, sum_e_logs)
+
+    return jax.jit(_kernel)
+
+
+def make_batched_energy_sharded(model, eta, g, mu, mesh, batch_size=None):
+    """
+    Returns a sharded function:
+        energy, uncert = fn(params, configs_sharded)
+    """
+
+    @partial(
+        shard_map.shard_map,
+        mesh=mesh,
+        in_specs=(P(), P("data", None, None)),
+        out_specs=(P(), P()),
+        check_rep=False,
+    )
+    def _kernel(params, configs):
+        sum_e, sum_e2, count = _energy_stats_local(
+            model, eta, g, mu, params, configs, batch_size=batch_size
+        )
+
+        sum_e = lax.psum(sum_e, "data")
+        sum_e2 = lax.psum(sum_e2, "data")
+        count = lax.psum(count, "data")
+
+        return _finalize_energy_from_global_sums(sum_e, sum_e2, count)
+
+    return jax.jit(_kernel)
+
+
+
+
+
+
 # ACTIVE IMPLEMENTATION (comment these lines to use originals above)
 spherical_laplacian_cartesian = spherical_laplacian_cartesian_opt
 config_energy = config_energy_opt
@@ -566,3 +772,8 @@ def sr_update(grad, logs_centered, damping: float = 1e-3, maxiter: int = 200):
 
     delta, info = jax.scipy.sparse.linalg.cg(matvec, grad, maxiter=maxiter)
     return delta, info
+
+
+
+
+
