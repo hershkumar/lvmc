@@ -6,7 +6,10 @@ from flax import linen as nn
 import jax
 from typing import Sequence, Callable, Optional
 from dataclasses import field
-
+import copy
+from typing import Any
+from flax.core import freeze, unfreeze
+from jax import lax
 
 """
 Feedfoward network for outputting psi(n(x)) given field configuration n(x) in cartesian coordinates with constraint n(x).n(x)=1
@@ -130,13 +133,12 @@ def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
     return jnp.einsum("...id,...jd->...ij", n, n)
 
 
-def remove_diagonal(g: jnp.ndarray) -> jnp.ndarray:
+def remove_diagonal(g: jnp.ndarray, eye: jnp.ndarray) -> jnp.ndarray:
     """
     Zero the diagonal of the Gram matrix.
     g: (..., L, L)
     """
     L = g.shape[-1]
-    eye = jnp.eye(L, dtype=g.dtype)
     return g * (1.0 - eye)
 
 
@@ -182,7 +184,6 @@ class GodSlayer(nn.Module):
     hidden_sizes: Sequence[int] = (64,)
     activation: Callable = nn.celu
     dtype: jnp.dtype = jnp.float32
-
     @nn.compact
     def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
         n = jnp.asarray(n, dtype=self.dtype)
@@ -190,8 +191,10 @@ class GodSlayer(nn.Module):
             raise ValueError(f"Expected input shape (..., L, 3), got {n.shape}")
 
         g = gram_matrix(n)              # (..., L, L)
-        g = remove_diagonal(g)          # (..., L, L)
         L = g.shape[-1]
+        eye = jnp.eye(L, dtype=g.dtype)
+        g = remove_diagonal(g, eye)     # (..., L, L)
+        
 
         w_self = self.param(
             "w_self",
@@ -248,108 +251,278 @@ class GodSlayer(nn.Module):
         return jnp.exp(-y)
 
 
+# ============================================================
+# Activation
+# ============================================================
+def _celu(x: jnp.ndarray, alpha: float = 1.0) -> jnp.ndarray:
+    xa = x / alpha
+    neg = alpha * jnp.expm1(jnp.minimum(xa, 0.0))
+    return jnp.maximum(x, 0.0) + neg
+
+
+def _celu_prime(x: jnp.ndarray, alpha: float = 1.0) -> jnp.ndarray:
+    xa = x / alpha
+    return jnp.where(x > 0, jnp.ones_like(x), jnp.exp(jnp.minimum(xa, 0.0)))
+
+def _build_kernel(w: jnp.ndarray, num_neighbors: int) -> jnp.ndarray:
+    """
+    w: (C, Nn+1)  — col 0 is w_self, cols 1: are w_neigh
+    returns: (C, 1, K, K) depthwise conv kernel
+    """
+    C  = w.shape[0]
+    Nn = num_neighbors
+    K  = 2 * Nn + 1
+    mid = Nn  # center index
+
+    # Start from zeros, scatter in the weights
+    k = jnp.zeros((C, K, K), dtype=w.dtype)
+
+    # Self weight at center
+    k = k.at[:, mid, mid].set(w[:, 0])
+
+    # Neighbor weights — symmetric cross pattern
+    for d in range(1, Nn + 1):
+        v = w[:, d]                          # (C,)
+        k = k.at[:, mid,     mid + d].set(v) # right
+        k = k.at[:, mid,     mid - d].set(v) # left
+        k = k.at[:, mid + d, mid    ].set(v) # down
+        k = k.at[:, mid - d, mid    ].set(v) # up
+
+    return k[:, None, :, :]  # (C, 1, K, K) for depthwise
+
+
+def _apply_layer(
+    x: jnp.ndarray,       # (..., C, L, L)
+    w: jnp.ndarray,       # (C, Nn+1)
+    num_neighbors: int,
+) -> jnp.ndarray:
+    C = x.shape[-3]
+    L = x.shape[-1]
+    batch_shape = x.shape[:-3]
+
+    kernel = _build_kernel(w, num_neighbors)   # (C, 1, K, K)
+    x_flat = x.reshape(-1, C, L, L)            # (B, C, L, L)
+
+    p = num_neighbors
+    x_pad = jnp.pad(
+        x_flat,
+        ((0, 0), (0, 0), (p, p), (p, p)),
+        mode="wrap",
+    )
+
+    y = lax.conv_general_dilated(
+        x_pad,
+        kernel,
+        window_strides=(1, 1),
+        padding="VALID",
+        feature_group_count=C,
+        dimension_numbers=("NCHW", "OIHW", "NCHW"),
+    )
+
+    return y.reshape(batch_shape + (C, L, L))
+
+
+
+# ============================================================
+# Fused residual stack with one custom VJP
+# ============================================================
+
+def make_godslayer2_fused_stack(num_neighbors: int):
+
+    def fused_stack(x0, weights, residual_scale):
+        s = jnp.asarray(residual_scale, dtype=x0.dtype)
+
+        def layer_forward(x_in, w):
+            y     = _apply_layer(x_in, w, num_neighbors)
+            x_out = x_in + s * _celu(y)
+            return x_out, None
+
+        x_final, _ = lax.scan(layer_forward, x0, weights)
+        return x_final
+
+    return fused_stack
+
+# ============================================================
+# Module
+# ============================================================
+
 class GodSlayer2(nn.Module):
-    num_layers: int
-    num_neighbors: int
-    num_channels: int = 1
-    activation: Callable = nn.celu
-    final_activation: Optional[Callable] = None
-    use_bias: bool = False
-    param_dtype: jnp.dtype = jnp.float32
+    num_layers:     int            = 1
+    num_neighbors:  int            = 1
+    num_channels:   int            = 1
+    activation:     Callable       = nn.celu
+    param_dtype:    jnp.dtype      = jnp.float32
+    residual_scale: float          = 1.0
 
     @staticmethod
     def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
         return jnp.einsum("...ia,...ja->...ij", n, n)
 
+    @staticmethod
+    def godslayer_laplacian_init(num_layers, num_neighbors, self_val=-0.15, neigh_val=0.04, noise=0.01):
+        def init(key, shape, dtype=jnp.float32):
+            L, C, K = shape
+            depth = jnp.sqrt(float(num_layers))
+            neigh = jnp.sqrt(float(max(1, num_neighbors)))
+            w = jnp.zeros(shape, dtype=dtype)
+            w = w.at[:, :, 0].set(self_val / depth)
+            if num_neighbors > 0:
+                w = w.at[:, :, 1:].set(neigh_val / (depth * neigh))
+            if noise > 0:
+                w = w + noise * jax.random.normal(key, shape, dtype)
+            return w
+        return init
+
     def setup(self) -> None:
         self.weights = self.param(
             "weights",
-            nn.initializers.lecun_normal(),
+            self.godslayer_laplacian_init(self.num_layers, self.num_neighbors),
             (self.num_layers, self.num_channels, self.num_neighbors + 1),
             self.param_dtype,
         )
-        if self.use_bias:
-            self.bias = self.param(
-                "bias",
-                nn.initializers.zeros,
-                (self.num_layers, self.num_channels),
-                self.param_dtype,
-            )
-
-    def _all_neighbor_sums(self, x: jnp.ndarray) -> jnp.ndarray:
-        """
-        Compute neighbor sums for all distances 1..N_N in one batched operation.
-
-        Instead of looping over d and calling roll 4 times each, we:
-          1. Stack all shift amounts into a single array
-          2. vmap a single pair of rolls over that array
-          3. Sum i and j shifts together
-
-        Parameters
-        ----------
-        x : (..., C, L, L)
-
-        Returns
-        -------
-        out : (N_N, ..., C, L, L)
-            out[d-1] = neighbor sum at distance d
-        """
-        shifts = jnp.arange(1, self.num_neighbors + 1)  # (N_N,)
-
-        def single_distance_sum(d):
-            return (
-                jnp.roll(x, d,  axis=-1) +
-                jnp.roll(x, -d, axis=-1) +
-                jnp.roll(x, d,  axis=-2) +
-                jnp.roll(x, -d, axis=-2)
-            )
-
-        # vmap over distances — compiles as a single batched gather rather than N_N separate ops
-        return jax.vmap(single_distance_sum)(shifts)  # (N_N, ..., C, L, L)
+        # Lift closure creation out of __call__ so it isn't re-traced each forward pass.
+        self._fused_stack = make_godslayer2_fused_stack(self.num_neighbors)
 
     def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
         if n.shape[-1] != 3:
             raise ValueError(f"Expected (..., L, 3), got {n.shape}")
 
-        L = n.shape[-2]
+        L     = n.shape[-2]
+        dtype = self.param_dtype
 
-        # Gram matrix, diagonal zeroed: (..., L, L)
-        g = self.gram_matrix(n)
-        g = g * (1.0 - jnp.eye(L, dtype=g.dtype))
-        g = (g + g.mT) * 0.5 # symmetrize to let XLA do better
-        # Expand to channels without broadcast copy: (..., C, L, L)
-        # Tile via einsum — gives XLA a clean contraction to fuse downstream
-        x = jnp.repeat(g[..., None, :, :], self.num_channels, axis=-3)
+        g   = self.gram_matrix(n).astype(dtype)
+        eye = jnp.eye(L, dtype=dtype)
+        g   = g * (1.0 - eye)
 
-        # Python loop — let XLA unroll and fuse across all layers
-        for layer in range(self.num_layers):
-            w = self.weights[layer]          # (C, N_N+1)
-            w_self   = w[:, 0]               # (C,)
-            w_neigh  = w[:, 1:]              # (C, N_N)
+        x0 = jnp.broadcast_to(
+            g[..., None, :, :],
+            g.shape[:-2] + (self.num_channels, L, L),
+        )
 
-            # Onsite term
-            y = x * w_self[..., None, None]  # (..., C, L, L)
+        s = jnp.asarray(self.residual_scale, dtype=dtype)
+        x = self._fused_stack(x0, self.weights, s)
 
-            if self.num_neighbors > 0:
-                # All neighbor sums at once: (N_N, ..., C, L, L)
-                ns = self._all_neighbor_sums(x)
-
-                # Contract over neighbor distances in one einsum:
-                #   w_neigh: (C, N_N)  ->  broadcast as (N_N, ..., C, 1, 1)
-                # This fuses the weighted sum over d into a single matmul-like op
-                y = y + jnp.einsum("d...cij,cd->...cij", ns, w_neigh)
-
-            if self.use_bias:
-                y = y + self.bias[layer][:, None, None]
-
-            x = self.activation(y)
-
-        out = jnp.sum(x, axis=(-1, -2, -3)) / (L * L)
-
-        if self.final_activation is not None:
-            out = self.final_activation(out)
-
+        out = jnp.mean(x, axis=(-1, -2, -3))
         return jnp.exp(-out)
+
+
+
+
+
+def transfer_learn(
+    params: Any,
+    new_num_layers: int,
+    new_num_channels: int,
+    *,
+    new_layer_weight_scale: float = 0.0,
+    freeze_output: bool = True,
+):
+    """
+    Expand parameters for the residual GodSlayer2 model to a larger number of
+    layers and/or channels.
+
+    Assumes the parameter tree contains:
+        params["params"]["weights"]
+
+    with shape:
+        (old_num_layers, old_num_channels, num_neighbors + 1)
+
+    Behavior
+    --------
+    1. Existing weights are copied exactly.
+    2. If new_num_channels > old_num_channels:
+         new channels are created by repeating old channels cyclically.
+    3. If new_num_layers > old_num_layers:
+         new layers are appended with very small / zero weights so that,
+         in the residual architecture,
+             x_out = x_in + residual_scale * activation(y),
+         the added layers initially do almost nothing.
+
+    Parameters
+    ----------
+    params
+        Flax params tree. Can be a FrozenDict or nested dict.
+    new_num_layers
+        Target number of layers. Must be >= old number of layers.
+    new_num_channels
+        Target number of channels. Must be >= old number of channels.
+    new_layer_weight_scale
+        Value used to initialize all weights in newly added layers.
+        For the residual architecture, 0.0 is the natural choice if you want
+        the added layers to start near "doing nothing".
+    freeze_output
+        If True and the input was FrozenDict-like, return a FrozenDict.
+
+    Returns
+    -------
+    new_params
+        Expanded parameter tree.
+    """
+    # Make a mutable copy
+    was_frozen = hasattr(params, "unfreeze")
+    p = unfreeze(params) if was_frozen else copy.deepcopy(params)
+
+    try:
+        old_w = p["params"]["weights"]
+    except KeyError as e:
+        raise KeyError(
+            "Could not find params['params']['weights'] in the provided parameter tree."
+        ) from e
+
+    if old_w.ndim != 3:
+        raise ValueError(
+            f"Expected params['params']['weights'] to have shape "
+            f"(num_layers, num_channels, num_neighbors + 1), got {old_w.shape}"
+        )
+
+    old_num_layers, old_num_channels, width = old_w.shape
+
+    if new_num_layers < old_num_layers:
+        raise ValueError(
+            f"new_num_layers={new_num_layers} must be >= old_num_layers={old_num_layers}"
+        )
+    if new_num_channels < old_num_channels:
+        raise ValueError(
+            f"new_num_channels={new_num_channels} must be >= old_num_channels={old_num_channels}"
+        )
+
+    dtype = old_w.dtype
+
+    # Allocate new weight tensor
+    new_w = jnp.zeros((new_num_layers, new_num_channels, width), dtype=dtype)
+
+    # Copy overlapping block exactly
+    new_w = new_w.at[:old_num_layers, :old_num_channels, :].set(old_w)
+
+    # Expand channels in existing layers by repeating old channels cyclically
+    if new_num_channels > old_num_channels:
+        extra_channel_idx = jnp.arange(old_num_channels, new_num_channels)
+        src_channel_idx = extra_channel_idx % old_num_channels
+        copied_channels = old_w[:, src_channel_idx, :]  # (old_layers, extra_channels, width)
+        new_w = new_w.at[:old_num_layers, old_num_channels:, :].set(copied_channels)
+
+    # Add new layers with near-zero weights so residual blocks start near identity
+    if new_num_layers > old_num_layers:
+        n_new_layers = new_num_layers - old_num_layers
+
+        added_layers = jnp.full(
+            (n_new_layers, new_num_channels, width),
+            jnp.asarray(new_layer_weight_scale, dtype=dtype),
+            dtype=dtype,
+        )
+
+        new_w = new_w.at[old_num_layers:, :, :].set(added_layers)
+
+    p["params"]["weights"] = new_w
+
+    if freeze_output and was_frozen:
+        return freeze(p)
+    return p
+
+
+
+
+
 
 
 def canonicalize_so3_fast(n, eps=1e-15):
