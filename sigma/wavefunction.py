@@ -611,7 +611,7 @@ class GodSlayer3(nn.Module):
         r = jnp.arange(L)
         j = (i[:, None] + r[None, :]) % L
         vals = h[..., i[:, None], j, :]     # (..., L, L, C)
-        return jnp.mean(vals, axis=-2)      # (..., L, C)
+        return jnp.mean(vals, axis=-3)      # (..., L, C)
 
     def setup(self):
         self.weights = self.param(
