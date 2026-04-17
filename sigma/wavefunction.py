@@ -394,6 +394,171 @@ class GodSlayer2(nn.Module):
         return jnp.exp(-out)
 
 
+#### More optimized
+
+
+
+def _celu(x: jnp.ndarray, alpha: float = 1.0) -> jnp.ndarray:
+    xa = x / alpha
+    neg = alpha * jnp.expm1(jnp.minimum(xa, 0.0))
+    return jnp.maximum(x, 0.0) + neg
+
+
+def _celu_prime(x: jnp.ndarray, alpha: float = 1.0) -> jnp.ndarray:
+    xa = x / alpha
+    return jnp.where(x > 0.0, 1.0, jnp.exp(jnp.minimum(xa, 0.0)))
+
+    
+def _stencil_apply(
+    x: jnp.ndarray,      # (..., L, L, C)
+    w: jnp.ndarray,      # (C, Nn+1)
+    num_neighbors: int,
+) -> jnp.ndarray:
+    # center
+    y = x * w[:, 0]
+
+    # neighbors
+    for d in range(1, num_neighbors + 1):
+        wd = w[:, d]
+        nbr = (
+            jnp.roll(x, +d, axis=-2) +  # rows
+            jnp.roll(x, -d, axis=-2) +
+            jnp.roll(x, +d, axis=-3) +  # cols
+            jnp.roll(x, -d, axis=-3)
+        )
+        y = y + nbr * wd
+
+    return y
+
+
+def make_godslayer2_layer(num_neighbors: int):
+    @jax.custom_vjp
+    def layer(x, w, residual_scale):
+        y = _stencil_apply(x, w, num_neighbors)
+        return x + residual_scale * _celu(y)
+
+    def layer_fwd(x, w, residual_scale):
+        y = _stencil_apply(x, w, num_neighbors)
+        out = x + residual_scale * _celu(y)
+        # save x, y, w for backward
+        return out, (x, y, w, residual_scale)
+
+    def layer_bwd(res, g_out):
+        x, y, w, residual_scale = res
+
+        delta = g_out * residual_scale * _celu_prime(y)
+
+        # dL/dx = g_out + A(w)^T delta
+        # operator is symmetric under periodic rolls, so A^T = A
+        gx = g_out + _stencil_apply(delta, w, num_neighbors)
+
+        # dL/dw
+        grads = []
+
+        # center weight
+        gw0 = jnp.sum(delta * x, axis=tuple(range(delta.ndim - 1)))
+        grads.append(gw0)
+
+        # neighbor weights
+        for d in range(1, num_neighbors + 1):
+            nbr = (
+                jnp.roll(x, +d, axis=-2) +
+                jnp.roll(x, -d, axis=-2) +
+                jnp.roll(x, +d, axis=-3) +
+                jnp.roll(x, -d, axis=-3)
+            )
+            gwd = jnp.sum(delta * nbr, axis=tuple(range(delta.ndim - 1)))
+            grads.append(gwd)
+
+        gw = jnp.stack(grads, axis=-1)  # (C, Nn+1)
+
+        # residual_scale gradient
+        gs = jnp.sum(g_out * _celu(y))
+
+        return gx, gw, gs
+
+    layer.defvjp(layer_fwd, layer_bwd)
+    return layer
+
+
+def make_godslayer2_fused_stack_nhwc_fast(num_neighbors: int):
+    layer = make_godslayer2_layer(num_neighbors)
+
+    def fused_stack(x0, weights, residual_scale):
+        def body(x, w):
+            x = layer(x, w, residual_scale)
+            return x, None
+
+        x_final, _ = lax.scan(body, x0, weights)
+        return x_final
+
+    return fused_stack
+
+
+class GodSlayer2(nn.Module):
+    num_layers: int = 1
+    num_neighbors: int = 1
+    num_channels: int = 1
+    param_dtype: jnp.dtype = jnp.float32
+    residual_scale: float = 1.0
+
+    @staticmethod
+    def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
+        return jnp.einsum("...ia,...ja->...ij", n, n)
+
+    @staticmethod
+    def godslayer_laplacian_init(
+        num_layers, num_neighbors,
+        self_val=-0.15, neigh_val=0.04, noise=0.05
+    ):
+        def init(key, shape, dtype=jnp.float32):
+            L, C, K = shape
+            depth = jnp.sqrt(float(num_layers))
+            neigh = jnp.sqrt(float(max(1, num_neighbors)))
+            w = jnp.zeros(shape, dtype=dtype)
+            w = w.at[:, :, 0].set(self_val / depth)
+            if num_neighbors > 0:
+                w = w.at[:, :, 1:].set(neigh_val / (depth * neigh))
+            if noise > 0:
+                w = w + noise * jax.random.normal(key, shape, dtype)
+            return w
+        return init
+
+    def setup(self):
+        self.weights = self.param(
+            "weights",
+            self.godslayer_laplacian_init(self.num_layers, self.num_neighbors),
+            (self.num_layers, self.num_channels, self.num_neighbors + 1),
+            self.param_dtype,
+        )
+        self._fused_stack = make_godslayer2_fused_stack_nhwc_fast(self.num_neighbors)
+
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        if n.shape[-1] != 3:
+            raise ValueError(f"Expected (..., L, 3), got {n.shape}")
+
+        L = n.shape[-2]
+        dtype = self.param_dtype
+
+        g = self.gram_matrix(n).astype(dtype)
+        g = g * (1.0 - jnp.eye(L, dtype=dtype))
+
+        x0 = jnp.broadcast_to(
+            g[..., :, :, None],
+            g.shape[:-2] + (L, L, self.num_channels),
+        )
+
+        x = self._fused_stack(
+            x0,
+            self.weights,
+            jnp.asarray(self.residual_scale, dtype=dtype),
+        )
+
+        out = jnp.mean(x, axis=(-1, -2, -3))
+        return jnp.exp(-out)
+
+
+
 
 def transfer_learn(
     params: Any,
@@ -401,64 +566,52 @@ def transfer_learn(
     new_num_channels: int,
     *,
     new_layer_weight_scale: float = 0.0,
-    freeze_output: bool = True,
+    channel_init: str = "zero",   # "zero", "repeat", "repeat_scale"
+    return_frozen: bool = True,
 ):
     """
-    Expand parameters for the residual GodSlayer2 model to a larger number of
-    layers and/or channels.
+    Expand parameters for a residual CNN/GodSlayer-style model.
 
-    Assumes the parameter tree contains:
-        params["params"]["weights"]
+    Expected tree:
+        params["params"]["weights"]  # shape (L, C, K)
 
-    with shape:
-        (old_num_layers, old_num_channels, num_neighbors + 1)
-
-    Behavior
-    --------
-    1. Existing weights are copied exactly.
-    2. If new_num_channels > old_num_channels:
-         new channels are created by repeating old channels cyclically.
-    3. If new_num_layers > old_num_layers:
-         new layers are appended with very small / zero weights so that,
-         in the residual architecture,
-             x_out = x_in + residual_scale * activation(y),
-         the added layers initially do almost nothing.
+    Optional:
+        params["params"]["bias"]     # shape (L, C)
 
     Parameters
     ----------
     params
-        Flax params tree. Can be a FrozenDict or nested dict.
+        Flax params tree, frozen or mutable.
     new_num_layers
-        Target number of layers. Must be >= old number of layers.
+        Target number of layers, must be >= old number.
     new_num_channels
-        Target number of channels. Must be >= old number of channels.
+        Target number of channels, must be >= old number.
     new_layer_weight_scale
-        Value used to initialize all weights in newly added layers.
-        For the residual architecture, 0.0 is the natural choice if you want
-        the added layers to start near "doing nothing".
-    freeze_output
-        If True and the input was FrozenDict-like, return a FrozenDict.
+        Fill value for newly added layers.
+    channel_init
+        How to initialize newly added channels in existing layers:
+          - "zero": keep old function most closely
+          - "repeat": copy old channels cyclically
+          - "repeat_scale": repeat old channels and scale by old_C / new_C
+    return_frozen
+        If True and the input was frozen-like, return a FrozenDict.
 
     Returns
     -------
     new_params
         Expanded parameter tree.
     """
-    # Make a mutable copy
-    was_frozen = hasattr(params, "unfreeze")
+    was_frozen = type(params).__name__ == "FrozenDict"
     p = unfreeze(params) if was_frozen else copy.deepcopy(params)
 
-    try:
-        old_w = p["params"]["weights"]
-    except KeyError as e:
-        raise KeyError(
-            "Could not find params['params']['weights'] in the provided parameter tree."
-        ) from e
+    if "params" not in p or "weights" not in p["params"]:
+        raise KeyError("Could not find params['params']['weights'].")
 
+    old_w = p["params"]["weights"]
     if old_w.ndim != 3:
         raise ValueError(
-            f"Expected params['params']['weights'] to have shape "
-            f"(num_layers, num_channels, num_neighbors + 1), got {old_w.shape}"
+            "Expected params['params']['weights'] to have shape "
+            f"(num_layers, num_channels, width), got {old_w.shape}"
         )
 
     old_num_layers, old_num_channels, width = old_w.shape
@@ -471,37 +624,93 @@ def transfer_learn(
         raise ValueError(
             f"new_num_channels={new_num_channels} must be >= old_num_channels={old_num_channels}"
         )
+    if channel_init not in {"zero", "repeat", "repeat_scale"}:
+        raise ValueError(
+            "channel_init must be one of {'zero', 'repeat', 'repeat_scale'}"
+        )
 
     dtype = old_w.dtype
 
-    # Allocate new weight tensor
+    # ---- weights ----
     new_w = jnp.zeros((new_num_layers, new_num_channels, width), dtype=dtype)
 
-    # Copy overlapping block exactly
+    # Copy old block exactly
     new_w = new_w.at[:old_num_layers, :old_num_channels, :].set(old_w)
 
-    # Expand channels in existing layers by repeating old channels cyclically
+    # Expand channels for existing layers
     if new_num_channels > old_num_channels:
-        extra_channel_idx = jnp.arange(old_num_channels, new_num_channels)
-        src_channel_idx = extra_channel_idx % old_num_channels
-        copied_channels = old_w[:, src_channel_idx, :]  # (old_layers, extra_channels, width)
-        new_w = new_w.at[:old_num_layers, old_num_channels:, :].set(copied_channels)
+        n_extra = new_num_channels - old_num_channels
 
-    # Add new layers with near-zero weights so residual blocks start near identity
+        if channel_init in {"repeat", "repeat_scale"}:
+            extra_channel_idx = jnp.arange(old_num_channels, new_num_channels)
+            src_channel_idx = extra_channel_idx % old_num_channels
+            copied_channels = old_w[:, src_channel_idx, :]  # (old_L, n_extra, width)
+
+            if channel_init == "repeat_scale":
+                copied_channels = copied_channels * (
+                    old_num_channels / new_num_channels
+                )
+
+                # Also scale the original copied block so total channel sum stays closer
+                scaled_old = old_w * (old_num_channels / new_num_channels)
+                new_w = new_w.at[:old_num_layers, :old_num_channels, :].set(scaled_old)
+
+            new_w = new_w.at[:old_num_layers, old_num_channels:, :].set(copied_channels)
+
+        elif channel_init == "zero":
+            # Leave added channels at zero
+            pass
+
+    # Add new layers near identity / near no-op
     if new_num_layers > old_num_layers:
         n_new_layers = new_num_layers - old_num_layers
-
         added_layers = jnp.full(
             (n_new_layers, new_num_channels, width),
-            jnp.asarray(new_layer_weight_scale, dtype=dtype),
+            fill_value=jnp.array(new_layer_weight_scale, dtype=dtype),
             dtype=dtype,
         )
-
         new_w = new_w.at[old_num_layers:, :, :].set(added_layers)
 
     p["params"]["weights"] = new_w
 
-    if freeze_output and was_frozen:
+    # ---- optional bias ----
+    if "bias" in p["params"]:
+        old_b = p["params"]["bias"]
+        if old_b.ndim != 2:
+            raise ValueError(
+                "Expected params['params']['bias'] to have shape "
+                f"(num_layers, num_channels), got {old_b.shape}"
+            )
+
+        if old_b.shape != (old_num_layers, old_num_channels):
+            raise ValueError(
+                "Bias shape does not match weights shape: "
+                f"bias={old_b.shape}, expected {(old_num_layers, old_num_channels)}"
+            )
+
+        new_b = jnp.zeros((new_num_layers, new_num_channels), dtype=old_b.dtype)
+        new_b = new_b.at[:old_num_layers, :old_num_channels].set(old_b)
+
+        if new_num_channels > old_num_channels:
+            if channel_init in {"repeat", "repeat_scale"}:
+                extra_channel_idx = jnp.arange(old_num_channels, new_num_channels)
+                src_channel_idx = extra_channel_idx % old_num_channels
+                copied_bias = old_b[:, src_channel_idx]
+
+                if channel_init == "repeat_scale":
+                    copied_bias = copied_bias * (old_num_channels / new_num_channels)
+                    scaled_old_b = old_b * (old_num_channels / new_num_channels)
+                    new_b = new_b.at[:old_num_layers, :old_num_channels].set(scaled_old_b)
+
+                new_b = new_b.at[:old_num_layers, old_num_channels:].set(copied_bias)
+
+        if new_num_layers > old_num_layers:
+            # New-layer bias remains zero, which is usually safest
+            pass
+
+        p["params"]["bias"] = new_b
+
+    if return_frozen and was_frozen:
         return freeze(p)
     return p
 
