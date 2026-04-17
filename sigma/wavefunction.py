@@ -572,15 +572,24 @@ def transfer_learn(
         return freeze(p)
     return p
 
+
 class GodSlayer3(nn.Module):
+    """
+    GodSlayer3:
+      - same fused stencil stack as GodSlayer2
+      - final invariant readout uses separation features
+            c_r = mean_i h_{i, i+r}
+        with periodic boundary conditions
+      - the resulting L * num_channels features are fed into a small MLP
+      - returns exp(-out)
+    """
     num_layers: int = 1
     num_neighbors: int = 1
     num_channels: int = 1
     mlp_hidden_sizes: Sequence[int] = (64, 64)
     mlp_activation: Callable = nn.celu
     param_dtype: jnp.dtype = jnp.float32
-    residual_scale: float = 0.25
-    eps: float = 1e-8
+    residual_scale: float = 1.0
 
     @staticmethod
     def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
@@ -589,11 +598,11 @@ class GodSlayer3(nn.Module):
     @staticmethod
     def godslayer_laplacian_init(
         num_layers, num_neighbors,
-        self_val=-0.05, neigh_val=0.02, noise=0.01
+        self_val=-0.15, neigh_val=0.04, noise=0.05
     ):
         def init(key, shape, dtype=jnp.float32):
             L, C, K = shape
-            depth = jnp.sqrt(float(max(1, num_layers)))
+            depth = jnp.sqrt(float(num_layers))
             neigh = jnp.sqrt(float(max(1, num_neighbors)))
             w = jnp.zeros(shape, dtype=dtype)
             w = w.at[:, :, 0].set(self_val / depth)
@@ -603,6 +612,21 @@ class GodSlayer3(nn.Module):
                 w = w + noise * jax.random.normal(key, shape, dtype)
             return w
         return init
+
+    @staticmethod
+    def separation_readout(h: jnp.ndarray) -> jnp.ndarray:
+        """
+        h: (..., L, L, C)
+        returns: (..., L, C) with
+            c_r^c = mean_i h_{i, i+r mod L, c}
+        """
+        L = h.shape[-3]
+        feats = []
+        for r in range(L):
+            hr = jnp.roll(h, shift=-r, axis=-2)                 # shift j-index
+            diag = jnp.diagonal(hr, axis1=-3, axis2=-2)         # (..., C, L)
+            feats.append(jnp.mean(diag, axis=-1))               # (..., C)
+        return jnp.stack(feats, axis=-2)                        # (..., L, C)
 
     def setup(self):
         self.weights = self.param(
@@ -614,43 +638,10 @@ class GodSlayer3(nn.Module):
         self._fused_stack = make_godslayer2_fused_stack_nhwc_fast(self.num_neighbors)
 
         self.mlp_layers = [
-            nn.Dense(
-                width,
-                param_dtype=self.param_dtype,
-                kernel_init=nn.initializers.lecun_normal(),
-                bias_init=nn.initializers.zeros,
-            )
+            nn.Dense(width, param_dtype=self.param_dtype)
             for width in self.mlp_hidden_sizes
         ]
-        self.out_layer = nn.Dense(
-            1,
-            param_dtype=self.param_dtype,
-            kernel_init=nn.initializers.normal(stddev=1e-2),
-            bias_init=nn.initializers.zeros,
-        )
-
-    def _site_field_from_matrix(self, x: jnp.ndarray) -> jnp.ndarray:
-        # (..., L, C)
-        h = jnp.mean(x, axis=-2)
-
-        # normalize per channel to prevent blow-up in q_r
-        rms = jnp.sqrt(jnp.mean(h * h, axis=-2, keepdims=True) + self.eps)
-        h = h / rms
-        return h
-
-    def _translation_invariant_moments(self, h: jnp.ndarray) -> jnp.ndarray:
-        """
-        h: (..., L, C)
-        return q: (..., L, C) with
-            q_r^c = mean_i h_i^c h_{i+r}^c
-        """
-        L = h.shape[-2]
-        qs = []
-        for r in range(L):
-            h_shift = jnp.roll(h, shift=-r, axis=-2)
-            q_r = jnp.mean(h * h_shift, axis=-2)   # (..., C), mean not sum
-            qs.append(q_r)
-        return jnp.stack(qs, axis=-2)              # (..., L, C)
+        self.out_layer = nn.Dense(1, param_dtype=self.param_dtype)
 
     @nn.compact
     def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
@@ -668,27 +659,22 @@ class GodSlayer3(nn.Module):
             g.shape[:-2] + (L, L, self.num_channels),
         )
 
-        x = self._fused_stack(
+        h = self._fused_stack(
             x0,
             self.weights,
             jnp.asarray(self.residual_scale, dtype=dtype),
-        )
+        )  # (..., L, L, C)
 
-        h = self._site_field_from_matrix(x)         # (..., L, C)
-        q = self._translation_invariant_moments(h)  # (..., L, C)
-
-        feat = q.reshape(*q.shape[:-2], -1)
+        c = self.separation_readout(h)              # (..., L, C)
+        feat = c.reshape(*c.shape[:-2], -1)         # (..., L*C)
 
         y = feat
         for dense in self.mlp_layers:
             y = dense(y)
             y = self.mlp_activation(y)
 
-        raw = jnp.squeeze(self.out_layer(y), axis=-1)
-
-        # Stable positive amplitude: psi = exp(-softplus(raw))
-        # avoids overflow from very negative raw
-        out = nn.softplus(raw)
+        out = self.out_layer(y)
+        out = jnp.squeeze(out, axis=-1)
         return jnp.exp(-out)
 
 def canonicalize_so3_fast(n, eps=1e-15):
