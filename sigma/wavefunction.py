@@ -574,15 +574,6 @@ def transfer_learn(
 
 
 class GodSlayer3(nn.Module):
-    """
-    GodSlayer3:
-      - same fused stencil stack as GodSlayer2
-      - final invariant readout uses separation features
-            c_r = mean_i h_{i, i+r}
-        with periodic boundary conditions
-      - the resulting L * num_channels features are fed into a small MLP
-      - returns exp(-out)
-    """
     num_layers: int = 1
     num_neighbors: int = 1
     num_channels: int = 1
@@ -614,19 +605,13 @@ class GodSlayer3(nn.Module):
         return init
 
     @staticmethod
-    def separation_readout(h: jnp.ndarray) -> jnp.ndarray:
-        """
-        h: (..., L, L, C)
-        returns: (..., L, C) with
-            c_r^c = mean_i h_{i, i+r mod L, c}
-        """
+    def separation_readout_fast(h: jnp.ndarray) -> jnp.ndarray:
         L = h.shape[-3]
-        feats = []
-        for r in range(L):
-            hr = jnp.roll(h, shift=-r, axis=-2)                 # shift j-index
-            diag = jnp.diagonal(hr, axis1=-3, axis2=-2)         # (..., C, L)
-            feats.append(jnp.mean(diag, axis=-1))               # (..., C)
-        return jnp.stack(feats, axis=-2)                        # (..., L, C)
+        i = jnp.arange(L)
+        r = jnp.arange(L)
+        j = (i[:, None] + r[None, :]) % L
+        vals = h[..., i[:, None], j, :]     # (..., L, L, C)
+        return jnp.mean(vals, axis=-2)      # (..., L, C)
 
     def setup(self):
         self.weights = self.param(
@@ -663,19 +648,19 @@ class GodSlayer3(nn.Module):
             x0,
             self.weights,
             jnp.asarray(self.residual_scale, dtype=dtype),
-        )  # (..., L, L, C)
+        )
 
-        c = self.separation_readout(h)              # (..., L, C)
-        feat = c.reshape(*c.shape[:-2], -1)         # (..., L*C)
+        c = self.separation_readout_fast(h)
+        feat = c.reshape(*c.shape[:-2], -1)
 
         y = feat
         for dense in self.mlp_layers:
             y = dense(y)
             y = self.mlp_activation(y)
 
-        out = self.out_layer(y)
-        out = jnp.squeeze(out, axis=-1)
+        out = jnp.squeeze(self.out_layer(y), axis=-1)
         return jnp.exp(-out)
+
 
 def canonicalize_so3_fast(n, eps=1e-15):
     """
