@@ -11,6 +11,8 @@ from typing import Any
 from flax.core import freeze, unfreeze
 from jax import lax
 
+import functools
+
 """
 Feedfoward network for outputting psi(n(x)) given field configuration n(x) in cartesian coordinates with constraint n(x).n(x)=1
 """
@@ -251,6 +253,7 @@ class GodSlayer(nn.Module):
         return jnp.exp(-y)
 
 
+
 def _celu(x: jnp.ndarray, alpha: float = 1.0) -> jnp.ndarray:
     xa = x / alpha
     neg = alpha * jnp.expm1(jnp.minimum(xa, 0.0))
@@ -389,8 +392,6 @@ class GodSlayer2(nn.Module):
 
         out = jnp.mean(x, axis=(-1, -2, -3))
         return jnp.exp(-out)
-
-
 
 
 

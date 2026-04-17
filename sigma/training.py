@@ -2,7 +2,6 @@ import optax
 from jax import numpy as jnp
 import numpy as np
 from observables import * 
-from observables import _batched_vmap
 from tqdm import trange
 
 # =============
@@ -85,7 +84,7 @@ def train(results, model, eta, g, mu, sampler, MC_options, steps, lr, fig=None, 
 
 
     prev_max_step = step_nums[-1] if step_nums else 0
-    pbar = trange(steps, desc="", leave=True)
+    pbar = trange(steps, desc="", leave=True, ncols=300)
 
     if not MC_options["chain"]:
         # loop over training steps
@@ -284,7 +283,7 @@ def sr_train(results, model, eta, g, mu, sampler, MC_options, steps, lr,
             fig.data[2].y = lower
 
     prev_max_step = step_nums[-1] if step_nums else 0
-    pbar = trange(steps, desc="", leave=True)
+    pbar = trange(steps, desc="", leave=True, ncols=300)
 
     if not MC_options["chain"]:
         for step_num in pbar:
@@ -429,7 +428,7 @@ def train_adapt(results, model, eta, g, mu, sampler, MC_options, steps, lr,
             fig.data[2].y = E_arr - sig_arr
 
     prev_max_step = step_nums[-1] if step_nums else 0
-    pbar = trange(steps, desc="", leave=True)
+    pbar = trange(steps, desc="", leave=True, ncols=300)
 
     if not MC_options["chain"]:
         for step_num in pbar:
@@ -581,7 +580,7 @@ def sr_train_adapt(results, model, eta, g, mu, sampler, MC_options, steps, lr,
             fig.data[2].y = E_arr - sig_arr
 
     prev_max_step = step_nums[-1] if step_nums else 0
-    pbar = trange(steps, desc="", leave=True)
+    pbar = trange(steps, desc="", leave=True, ncols=300)
 
     if not MC_options["chain"]:
         for step_num in pbar:
@@ -666,6 +665,10 @@ def sr_train_adapt(results, model, eta, g, mu, sampler, MC_options, steps, lr,
             )[:, -1]
 
     return params, avg_energies, avg_uncerts
+
+
+
+
 
 
 
@@ -756,7 +759,7 @@ def train_adapt_shard(
             fig.data[2].y = E_arr - sig_arr
 
     prev_max_step = step_nums[-1] if step_nums else 0
-    pbar = trange(steps, desc="", leave=True)
+    pbar = trange(steps, desc="", leave=True, ncols=300)
 
     if not MC_options["chain"]:
         for step_num in pbar:
@@ -850,3 +853,210 @@ def train_adapt_shard(
 
     return params, avg_energies, avg_uncerts
 
+
+
+# ============================================================
+# Sharded SR train_adapt
+# ============================================================
+
+def sr_train_adapt_shard(
+    results,
+    model,
+    eta,
+    g,
+    mu,
+    sampler,
+    MC_options,
+    steps,
+    lr,
+    damping_init=0.1,
+    damping_final=1e-3,
+    damping_decay=0.05,
+    target_accept=0.50,
+    adapt_rate=0.05,
+    fig=None,
+    batch_size=None,
+    clip_threshold=1.0,
+    mesh=None,
+):
+    """
+    Optimized sharded variant of sr_train_adapt.
+
+    Preserves:
+      - adaptive proposal-angle update
+      - exponential damping schedule
+      - optional chain continuation
+      - plotting / progress-bar behavior
+
+    Changes:
+      - params replicated across the mesh
+      - sampled configs sharded across leading sample axis
+      - exact dense SR in flat parameter space instead of matrix-free CG
+    """
+    if mesh is None:
+        mesh = make_data_mesh()
+
+    replicated = NamedSharding(mesh, P())
+    configs_sharding = NamedSharding(mesh, P("data", None, None))
+
+    example_params = results[0]
+    pytree_to_vec, vec_to_pytree, n_params, _ = make_param_vectorizer(example_params)
+
+    sr_dense_stats_sharded_fn = make_sr_dense_stats_sharded(
+        model, eta, g, mu, mesh, example_params, batch_size=batch_size
+    )
+
+    params = jax.device_put(results[0], replicated)
+    step_nums = list(np.arange(len(results[1])))
+    avg_energies = results[1]
+    avg_uncerts = results[2]
+
+    var_rad = float(MC_options["var"])
+
+    def push_point(fig, step, e, s):
+        e_host = float(jax.device_get(e))
+        s_host = float(jax.device_get(s))
+
+        step_nums.append(step)
+        avg_energies.append(e_host)
+        avg_uncerts.append(s_host)
+
+        steps_arr = jnp.asarray(step_nums)
+        E_arr = jnp.asarray(avg_energies)
+        sig_arr = jnp.asarray(avg_uncerts)
+
+        with fig.batch_update():
+            fig.data[0].x = steps_arr
+            fig.data[0].y = E_arr
+            fig.data[1].x = steps_arr
+            fig.data[1].y = E_arr + sig_arr
+            fig.data[2].x = steps_arr
+            fig.data[2].y = E_arr - sig_arr
+
+    prev_max_step = step_nums[-1] if step_nums else 0
+    pbar = trange(steps, desc="", leave=True, ncols=300)
+
+    if not MC_options["chain"]:
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
+
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                MC_options["pos_initials"],
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            samples = jax.device_put(samples, configs_sharding)
+
+            params, energy, uncert, info = sr_step_shard(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                mesh,
+                example_params=example_params,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+                sr_dense_stats_sharded_fn=sr_dense_stats_sharded_fn,
+                pytree_to_vec=pytree_to_vec,
+                vec_to_pytree=vec_to_pytree,
+                n_params=n_params,
+            )
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | solver = dense | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+    else:
+        prev_samples = MC_options["pos_initials"]
+
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
+
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                prev_samples,
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            prev_samples = samples.reshape(
+                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
+                + sampler.shape
+            )[:, -1]
+
+            samples = jax.device_put(samples, configs_sharding)
+
+            params, energy, uncert, info = sr_step_shard(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                mesh,
+                example_params=example_params,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+                sr_dense_stats_sharded_fn=sr_dense_stats_sharded_fn,
+                pytree_to_vec=pytree_to_vec,
+                vec_to_pytree=vec_to_pytree,
+                n_params=n_params,
+            )
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | solver = dense | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+    return params, avg_energies, avg_uncerts

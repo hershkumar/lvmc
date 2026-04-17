@@ -1,7 +1,12 @@
 import jax
 import jax.numpy as jnp
+import numpy as np 
 from jax import random, lax
 from functools import partial
+from jax.experimental import shard_map
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+
 
 EPS = 1e-12
 
@@ -577,3 +582,210 @@ class ClusterSampler:
         acc_rate = acc_rates.mean()
         return samples, acc_rate
 
+
+
+
+#### Sharded sampler
+from jax.experimental import shard_map
+from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
+
+
+class newSamplerSharded:
+    def __init__(self, psi, shape, mesh=None):
+        self.psi = psi
+        self.shape = tuple(shape)
+        if self.shape[-1] != 3:
+            raise ValueError(f"Expected last dim = 3, got {self.shape}")
+
+        if mesh is None:
+            devices = np.array(jax.local_devices())
+            if devices.size < 2:
+                raise ValueError(f"Need at least 2 local devices, got {devices.size}: {devices}")
+            mesh = Mesh(devices, axis_names=("data",))
+        self.mesh = mesh
+
+        self._replicated = NamedSharding(self.mesh, P())
+        self._chains_sharding = NamedSharding(
+            self.mesh,
+            P("data", None, None),  # (nchains, N, 3)
+        )
+        self._seeds_sharding = NamedSharding(
+            self.mesh,
+            P("data",),            # (nchains,)
+        )
+
+    def _mh_step_rng(self, log_psi_fn, carry, stepsize):
+        """
+        carry = (key, pos, log_pos, acc)
+        Generates axis/angle/log_u on the fly.
+        """
+        key, pos, log_pos, acc = carry
+        key, k_axis, k_u, k_ang = random.split(key, 4)
+
+        axis_raw = random.normal(k_axis, shape=self.shape, dtype=pos.dtype)
+        axis = normalize(axis_raw, axis=-1)
+
+        angle = random.uniform(
+            k_ang,
+            shape=self.shape[:-1],
+            minval=-stepsize,
+            maxval=stepsize,
+            dtype=pos.dtype,
+        )
+        log_u = jnp.log(random.uniform(k_u, shape=(), dtype=pos.dtype))
+
+        prop = rodrigues_rotate(pos, axis, angle)
+        prop = project_to_sphere(prop)
+
+        log_new = log_psi_fn(prop)
+        accept = log_u <= 2.0 * (log_new - log_pos)
+
+        pos = lax.select(accept, prop, pos)
+        log_pos = lax.select(accept, log_new, log_pos)
+        acc = acc + accept.astype(acc.dtype)
+
+        return (key, pos, log_pos, acc)
+
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
+    def run_chain(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initial, seed):
+        pos = project_to_sphere(jnp.asarray(pos_initial))
+        stepsize = jnp.asarray(stepsize, dtype=pos.dtype)
+
+        key = random.PRNGKey(seed)
+
+        def log_psi_fn(x):
+            return jnp.log(jnp.abs(self.psi(params, x)) + 1e-300)
+
+        log_pos = log_psi_fn(pos)
+        acc0 = jnp.array(0, dtype=jnp.int32)
+
+        def therm_body(carry, _):
+            carry = self._mh_step_rng(log_psi_fn, carry, stepsize)
+            return carry, None
+
+        (key, pos, log_pos, acc_therm), _ = lax.scan(
+            therm_body, (key, pos, log_pos, acc0), xs=None, length=Ntherm
+        )
+
+        def one_sweep(carry, _):
+            key, pos, log_pos, acc = carry
+
+            def one_keep_step(carry2, _):
+                return self._mh_step_rng(log_psi_fn, carry2, stepsize), None
+
+            (key, pos, log_pos, acc), _ = lax.scan(
+                one_keep_step, (key, pos, log_pos, acc), xs=None, length=keep
+            )
+            return (key, pos, log_pos, acc), pos
+
+        (key, pos, log_pos, acc_total), samples = lax.scan(
+            one_sweep, (key, pos, log_pos, acc0), xs=None, length=Nsweeps
+        )
+
+        total_steps = Ntherm + Nsweeps * keep
+        acc_rate = (acc_therm + acc_total) / jnp.asarray(total_steps, dtype=jnp.float32)
+
+        return samples, acc_rate
+
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
+    def run_many_chains(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initials, seeds):
+        """
+        Original single-device version, kept for compatibility.
+        """
+        pos_initials = jnp.asarray(pos_initials)
+        seeds = jnp.asarray(seeds, dtype=jnp.uint32)
+
+        samples_per_chain, acc_rates = jax.vmap(
+            lambda pos0, sd: self.run_chain(
+                params, Nsweeps, Ntherm, keep, stepsize, pos0, sd
+            ),
+            in_axes=(0, 0),
+            out_axes=(0, 0),
+        )(pos_initials, seeds)
+
+        nchains = pos_initials.shape[0]
+        samples = samples_per_chain.reshape((nchains * Nsweeps,) + self.shape)
+        acc_rate = acc_rates.mean()
+        return samples, acc_rate
+        
+    def _make_run_many_chains_sharded_kernel(self, Nsweeps, Ntherm, keep):
+        @partial(
+            shard_map.shard_map,
+            mesh=self.mesh,
+            in_specs=(P(), P("data", None, None), P("data",), P()),
+            out_specs=(P(), P()),
+            check_rep=False,
+        )
+        def _kernel(params, pos_initials, seeds, stepsize):
+    
+            def run_local_chain(pos0, sd):
+                return self.run_chain(params, Nsweeps, Ntherm, keep, stepsize, pos0, sd)
+    
+            samples_local, acc_rates_local = jax.vmap(
+                run_local_chain, in_axes=(0, 0), out_axes=(0, 0)
+            )(pos_initials, seeds)
+    
+            samples_all = lax.all_gather(samples_local, "data", axis=0, tiled=True)
+            acc_rates_all = lax.all_gather(acc_rates_local, "data", axis=0, tiled=True)
+    
+            nchains_total = samples_all.shape[0]
+            samples = samples_all.reshape((nchains_total * Nsweeps,) + self.shape)
+            acc_rate = jnp.mean(acc_rates_all)
+    
+            return samples, acc_rate
+    
+        return _kernel
+
+    def run_many_chains_shard(
+        self,
+        params,
+        Nsweeps,
+        Ntherm,
+        keep,
+        stepsize,
+        pos_initials,
+        seeds,
+    ):
+        """
+        Sharded multi-GPU variant.
+
+        Parameters
+        ----------
+        params : pytree
+            Model parameters. Replicated across devices.
+        Nsweeps, Ntherm, keep : int
+            Same meanings as in run_chain / run_many_chains.
+        stepsize : scalar
+            Proposal angle scale.
+        pos_initials : array, shape (nchains, N, 3)
+            Initial chain states.
+        seeds : array, shape (nchains,)
+            RNG seeds for each chain.
+
+        Returns
+        -------
+        samples : array, shape (nchains * Nsweeps, N, 3)
+            Same flattened layout as run_many_chains.
+        acc_rate : scalar
+            Mean acceptance rate over all chains.
+        """
+        pos_initials = jnp.asarray(pos_initials)
+        seeds = jnp.asarray(seeds, dtype=jnp.uint32)
+
+        nchains = pos_initials.shape[0]
+        ndev = self.mesh.devices.size
+
+        if nchains % ndev != 0:
+            raise ValueError(
+                f"nchains={nchains} must be divisible by number of devices={ndev} "
+                f"for this sharded sampler."
+            )
+
+        params = jax.device_put(params, self._replicated)
+        pos_initials = jax.device_put(pos_initials, self._chains_sharding)
+        seeds = jax.device_put(seeds, self._seeds_sharding)
+
+        kernel = self._make_run_many_chains_sharded_kernel(Nsweeps, Ntherm, keep)
+        stepsize = jnp.asarray(stepsize)
+        samples, acc_rate = kernel(params, pos_initials, seeds, stepsize)
+        return samples, acc_rate

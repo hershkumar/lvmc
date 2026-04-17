@@ -775,5 +775,198 @@ def sr_update(grad, logs_centered, damping: float = 1e-3, maxiter: int = 200):
 
 
 
+# ============================================================
+# Flat-parameter helpers
+# ============================================================
+
+def make_param_vectorizer(example_params):
+    """
+    Build flat <-> pytree conversions once from an example parameter pytree.
+
+    Returns
+    -------
+    pytree_to_vec : callable
+        Flattens a pytree with the same structure as example_params to shape (P,).
+    vec_to_pytree : callable
+        Unravels a vector of shape (P,) back to the parameter pytree.
+    n_params : int
+        Total number of scalar parameters.
+    dtype : dtype
+        Flat vector dtype from the exemplar params.
+    """
+    flat0, vec_to_pytree = ravel_pytree(example_params)
+    n_params = int(flat0.shape[0])
+    flat_dtype = flat0.dtype
+
+    def pytree_to_vec(tree):
+        leaves = jax.tree_util.tree_leaves(tree)
+        if not leaves:
+            return jnp.zeros((0,), dtype=flat_dtype)
+        return jnp.concatenate([leaf.reshape(-1) for leaf in leaves], axis=0)
+
+    return pytree_to_vec, vec_to_pytree, n_params, flat_dtype
 
 
+# ============================================================
+# Exact dense sharded SR statistics
+# ============================================================
+
+def make_sr_dense_stats_sharded(model, eta, g_coup, mu, mesh, example_params, batch_size=None):
+    """
+    Returns a sharded function:
+        grad_vec, S, E, uncert = fn(params, configs_sharded)
+
+    where:
+      - grad_vec is the exact flat SR gradient 2 * Cov(E, O)
+      - S is the exact dense SR/Fisher matrix Cov(O, O)
+      - E and uncert are the raw mean energy and standard error
+
+    This version is optimized for small parameter count P:
+      - it works in flat parameter space
+      - it avoids storing/logically manipulating logs_centered as pytrees
+      - it forms the dense P x P SR matrix once per step
+      - it preserves the original global median/MAD clipping rule exactly
+        by all-gathering the energies (1D only)
+    """
+    pytree_to_vec, _, n_params, _ = make_param_vectorizer(example_params)
+
+    @partial(
+        shard_map.shard_map,
+        mesh=mesh,
+        in_specs=(P(), P("data", None, None)),
+        out_specs=(P(), P(), P(), P()),
+        check_rep=False,
+    )
+    def _kernel(params, configs):
+        # Local shard computation: return energy + flat log-derivative vector per sample.
+        def local_fn(config):
+            e, log_grad_tree = local_terms_opt(model, eta, g_coup, mu, params, config)
+            return e, pytree_to_vec(log_grad_tree)
+
+        energies, O_local = _batched_vmap(local_fn, configs, batch_size)
+        # energies: (n_local,)
+        # O_local:  (n_local, P)
+
+        n_local = energies.shape[0]
+        local_count = jnp.asarray(n_local, dtype=energies.dtype)
+
+        # Raw global energy stats (exact)
+        local_sum_e = jnp.sum(energies)
+        local_sum_e2 = jnp.sum(energies * energies)
+
+        count = lax.psum(local_count, "data")
+        sum_e = lax.psum(local_sum_e, "data")
+        sum_e2 = lax.psum(local_sum_e2, "data")
+
+        inv_count = 1.0 / count
+        E = sum_e * inv_count
+        var = jnp.maximum(sum_e2 * inv_count - E * E, jnp.array(0.0, dtype=sum_e.dtype))
+        uncert = jnp.sqrt(var * inv_count)
+
+        # Global mean log-derivative (exact)
+        local_sum_O = jnp.sum(O_local, axis=0)           # (P,)
+        sum_O = lax.psum(local_sum_O, "data")            # (P,)
+        mean_O = sum_O * inv_count                       # (P,)
+        O_centered_local = O_local - mean_O[None, :]     # (n_local, P)
+
+        # Exact global clipping thresholds:
+        # gather only the 1D energies, not the log-derivatives.
+        # This restores the original single-device median/MAD clipping rule.
+        energies_all = lax.all_gather(energies, "data", axis=0, tiled=True)  # (N,)
+        median = jnp.median(energies_all)
+        mad = jnp.median(jnp.abs(energies_all - median))
+        lower = median - 5.0 * mad
+        upper = median + 5.0 * mad
+
+        energies_clipped_local = jnp.clip(energies, lower, upper)
+
+        # Global mean of clipped energies (exact)
+        local_sum_ec = jnp.sum(energies_clipped_local)
+        sum_ec = lax.psum(local_sum_ec, "data")
+        mean_ec = sum_ec * inv_count
+        e_centered_local = energies_clipped_local - mean_ec   # (n_local,)
+
+        # Exact dense SR gradient and Fisher matrix from local shard contributions.
+        local_grad = O_centered_local.T @ e_centered_local     # (P,)
+        local_S = O_centered_local.T @ O_centered_local        # (P, P)
+
+        grad_vec = (2.0 * lax.psum(local_grad, "data")) * inv_count
+        S = lax.psum(local_S, "data") * inv_count
+
+        return grad_vec, S, E, uncert
+
+    return jax.jit(_kernel)
+
+
+# ============================================================
+# Dense flat SR solve
+# ============================================================
+
+def _solve_dense_spd(A, b):
+    """
+    Solve A x = b for SPD A using Cholesky + triangular solves.
+    """
+    L = jnp.linalg.cholesky(A)
+    y = lax.linalg.triangular_solve(
+        L, b[:, None], left_side=True, lower=True
+    )
+    x = lax.linalg.triangular_solve(
+        L, y, left_side=True, lower=True, transpose_a=True
+    )
+    return x[:, 0]
+
+
+def sr_step_shard(
+    model,
+    eta,
+    g_coup,
+    mu,
+    params,
+    configs_sharded,
+    lr,
+    mesh,
+    example_params,
+    damping=1e-3,
+    clip_threshold=1.0,
+    batch_size=None,
+    sr_dense_stats_sharded_fn=None,
+    pytree_to_vec=None,
+    vec_to_pytree=None,
+    n_params=None,
+):
+    """
+    Optimized sharded SR step.
+
+    Changes relative to the earlier sharded SR step:
+      - computes exact dense SR matrix S in flat parameter space
+      - solves (S + damping I) delta = grad directly
+      - avoids matrix-free CG and repeated Fisher matvec passes
+      - avoids storing logs_centered as a distributed pytree
+
+    This is the right choice when parameter count P is small/moderate.
+    """
+    if pytree_to_vec is None or vec_to_pytree is None or n_params is None:
+        pytree_to_vec, vec_to_pytree, n_params, _ = make_param_vectorizer(example_params)
+
+    if sr_dense_stats_sharded_fn is None:
+        sr_dense_stats_sharded_fn = make_sr_dense_stats_sharded(
+            model, eta, g_coup, mu, mesh, example_params, batch_size=batch_size
+        )
+
+    grad_vec, S, E, uncert = sr_dense_stats_sharded_fn(params, configs_sharded)
+
+    eye = jnp.eye(n_params, dtype=S.dtype)
+    A = S + damping * eye
+    delta_vec = _solve_dense_spd(A, grad_vec)
+
+    if clip_threshold is not None:
+        delta_norm = jnp.linalg.norm(delta_vec)
+        scale = jnp.minimum(1.0, clip_threshold / (delta_norm + 1e-12))
+        delta_vec = delta_vec * scale
+
+    delta = vec_to_pytree(delta_vec)
+    new_params = jax.tree_util.tree_map(lambda p, d: p - lr * d, params, delta)
+
+    # keep the old API shape; info=0 now means dense solve used successfully
+    info = jnp.asarray(0, dtype=jnp.int32)
+    return new_params, E, uncert, info
