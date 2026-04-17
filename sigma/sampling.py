@@ -613,7 +613,6 @@ class newSamplerSharded:
             self.mesh,
             P("data",),            # (nchains,)
         )
-        self._kernel_cache = {}
 
     def _mh_step_rng(self, log_psi_fn, carry, stepsize):
         """
@@ -710,15 +709,11 @@ class newSamplerSharded:
         return samples, acc_rate
         
     def _make_run_many_chains_sharded_kernel(self, Nsweeps, Ntherm, keep):
-        cache_key = (Nsweeps, Ntherm, keep)
-        if cache_key in self._kernel_cache:
-            return self._kernel_cache[cache_key]
-
         @partial(
             shard_map.shard_map,
             mesh=self.mesh,
             in_specs=(P(), P("data", None, None), P("data",), P()),
-            out_specs=(P("data", None, None), P("data", None, None), P()),
+            out_specs=(P(), P()),
             check_rep=False,
         )
         def _kernel(params, pos_initials, seeds, stepsize):
@@ -729,61 +724,17 @@ class newSamplerSharded:
             samples_local, acc_rates_local = jax.vmap(
                 run_local_chain, in_axes=(0, 0), out_axes=(0, 0)
             )(pos_initials, seeds)
-
-            last_pos_local = samples_local[:, -1]
-            samples_local = samples_local.reshape((-1,) + self.shape)
-
-            acc_sum_local = jnp.sum(acc_rates_local)
-            count_local = jnp.asarray(acc_rates_local.shape[0], dtype=jnp.float32)
-            acc_rate = lax.psum(acc_sum_local, "data") / lax.psum(count_local, "data")
-
-            return samples_local, last_pos_local, acc_rate
-
-        self._kernel_cache[cache_key] = _kernel
+    
+            samples_all = lax.all_gather(samples_local, "data", axis=0, tiled=True)
+            acc_rates_all = lax.all_gather(acc_rates_local, "data", axis=0, tiled=True)
+    
+            nchains_total = samples_all.shape[0]
+            samples = samples_all.reshape((nchains_total * Nsweeps,) + self.shape)
+            acc_rate = jnp.mean(acc_rates_all)
+    
+            return samples, acc_rate
+    
         return _kernel
-
-    def run_many_chains_shard_stateful(
-        self,
-        params,
-        Nsweeps,
-        Ntherm,
-        keep,
-        stepsize,
-        pos_initials,
-        seeds,
-    ):
-        """
-        Sharded multi-device variant that keeps chain state sharded on device.
-
-        Returns
-        -------
-        samples : array, shape (nchains * Nsweeps, N, 3)
-            Leading sample axis remains sharded across devices.
-        last_pos : array, shape (nchains, N, 3)
-            Final position of each chain, sharded across devices.
-        acc_rate : scalar
-            Mean acceptance rate over all chains.
-        """
-        pos_initials = jnp.asarray(pos_initials)
-        seeds = jnp.asarray(seeds, dtype=jnp.uint32)
-
-        nchains = pos_initials.shape[0]
-        ndev = self.mesh.devices.size
-
-        if nchains % ndev != 0:
-            raise ValueError(
-                f"nchains={nchains} must be divisible by number of devices={ndev} "
-                f"for this sharded sampler."
-            )
-
-        params = jax.device_put(params, self._replicated)
-        pos_initials = jax.device_put(pos_initials, self._chains_sharding)
-        seeds = jax.device_put(seeds, self._seeds_sharding)
-
-        kernel = self._make_run_many_chains_sharded_kernel(Nsweeps, Ntherm, keep)
-        stepsize = jnp.asarray(stepsize)
-        samples, last_pos, acc_rate = kernel(params, pos_initials, seeds, stepsize)
-        return samples, last_pos, acc_rate
 
     def run_many_chains_shard(
         self,
@@ -814,18 +765,27 @@ class newSamplerSharded:
         Returns
         -------
         samples : array, shape (nchains * Nsweeps, N, 3)
-            Same flattened layout as run_many_chains, with the leading sample
-            axis sharded across devices.
+            Same flattened layout as run_many_chains.
         acc_rate : scalar
             Mean acceptance rate over all chains.
         """
-        samples, _, acc_rate = self.run_many_chains_shard_stateful(
-            params,
-            Nsweeps,
-            Ntherm,
-            keep,
-            stepsize,
-            pos_initials,
-            seeds,
-        )
+        pos_initials = jnp.asarray(pos_initials)
+        seeds = jnp.asarray(seeds, dtype=jnp.uint32)
+
+        nchains = pos_initials.shape[0]
+        ndev = self.mesh.devices.size
+
+        if nchains % ndev != 0:
+            raise ValueError(
+                f"nchains={nchains} must be divisible by number of devices={ndev} "
+                f"for this sharded sampler."
+            )
+
+        params = jax.device_put(params, self._replicated)
+        pos_initials = jax.device_put(pos_initials, self._chains_sharding)
+        seeds = jax.device_put(seeds, self._seeds_sharding)
+
+        kernel = self._make_run_many_chains_sharded_kernel(Nsweeps, Ntherm, keep)
+        stepsize = jnp.asarray(stepsize)
+        samples, acc_rate = kernel(params, pos_initials, seeds, stepsize)
         return samples, acc_rate
