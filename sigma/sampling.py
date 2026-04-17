@@ -789,3 +789,309 @@ class newSamplerSharded:
         stepsize = jnp.asarray(stepsize)
         samples, acc_rate = kernel(params, pos_initials, seeds, stepsize)
         return samples, acc_rate
+
+
+
+##### SHarded cluster sampler
+class ClusterSamplerSharded:
+    def __init__(self, psi, shape, mesh=None):
+        self.psi = psi
+        self.shape = tuple(shape)
+        if self.shape[-1] != 3:
+            raise ValueError(f"Expected last dim = 3, got {self.shape}")
+
+        N = self.shape[0]
+        self.neighbors = jnp.stack(
+            [
+                (jnp.arange(N, dtype=jnp.int32) - 1) % N,
+                (jnp.arange(N, dtype=jnp.int32) + 1) % N,
+            ],
+            axis=-1,
+        )
+
+        if mesh is None:
+            devices = np.array(jax.local_devices())
+            if devices.size < 2:
+                raise ValueError(
+                    f"Need at least 2 local devices, got {devices.size}: {devices}"
+                )
+            mesh = Mesh(devices, axis_names=("data",))
+        self.mesh = mesh
+
+        self._replicated = NamedSharding(self.mesh, P())
+        self._chains_sharding = NamedSharding(
+            self.mesh,
+            P("data", None, None),   # (nchains, N, 3)
+        )
+        self._seeds_sharding = NamedSharding(
+            self.mesh,
+            P("data",),              # (nchains,)
+        )
+
+    # --------------------------------------------------------------
+    # Cluster construction
+    # --------------------------------------------------------------
+    def _build_cluster(self, key, projections, beta_embed, seed_site):
+        N = projections.shape[0]
+        neighbors = self.neighbors
+        n_nbr = neighbors.shape[1]
+
+        in_cluster = jnp.zeros(N, dtype=jnp.bool_)
+        stack = jnp.zeros(N, dtype=jnp.int32)
+
+        in_cluster = in_cluster.at[seed_site].set(True)
+        stack = stack.at[0].set(seed_site)
+
+        pp = jnp.int32(0)
+        ss = jnp.int32(1)
+
+        def cond_fn(state):
+            _, _, pp, ss, _ = state
+            return pp < ss
+
+        def body_fn(state):
+            in_cluster, stack, pp, ss, key = state
+            site = stack[pp]
+            pp = pp + 1
+
+            def process_neighbor(carry, nb_idx):
+                in_cluster, ss, stack, key = carry
+                nb = neighbors[site, nb_idx]
+
+                key, subkey = random.split(key)
+
+                p_bond = jnp.maximum(
+                    0.0,
+                    1.0 - jnp.exp(
+                        -2.0 * beta_embed * projections[site] * projections[nb]
+                    ),
+                )
+
+                u = random.uniform(subkey, dtype=projections.dtype)
+                add = (~in_cluster[nb]) & (u < p_bond)
+
+                in_cluster = in_cluster.at[nb].set(in_cluster[nb] | add)
+                stack = stack.at[ss].set(jnp.where(add, nb, stack[ss]))
+                ss = ss + add.astype(jnp.int32)
+
+                return (in_cluster, ss, stack, key), None
+
+            (in_cluster, ss, stack, key), _ = lax.scan(
+                process_neighbor,
+                (in_cluster, ss, stack, key),
+                jnp.arange(n_nbr),
+            )
+            return (in_cluster, stack, pp, ss, key)
+
+        in_cluster, _, _, _, key = lax.while_loop(
+            cond_fn, body_fn, (in_cluster, stack, pp, ss, key)
+        )
+        return in_cluster, key
+
+    # --------------------------------------------------------------
+    # Boundary energy difference for Hastings correction
+    # --------------------------------------------------------------
+    def _boundary_delta_E(self, pos, prop, in_cluster):
+        """
+        delta_E = E(prop) - E(old) for
+            E = - sum_{<ij>} n_i · n_j
+        computed only from boundary bonds.
+        """
+        ic = in_cluster                      # (N,)
+        nb = self.neighbors                  # (N, 2)
+        ic_nb = ic[nb]                       # (N, 2)
+
+        boundary = ic[:, None] & (~ic_nb)    # count only i in cluster, j out
+
+        diff = prop - pos                    # (N, 3)
+        pos_nb = pos[nb]                     # (N, 2, 3)
+        dot = jnp.sum(diff[:, None, :] * pos_nb, axis=-1)   # (N, 2)
+
+        delta_E = -jnp.sum(dot * boundary)
+        return delta_E
+
+    # --------------------------------------------------------------
+    # One cluster MH step
+    # --------------------------------------------------------------
+    def _cluster_step_rng(self, log_psi_fn, carry, beta_embed):
+        key, pos, log_pos, acc = carry
+        N = pos.shape[0]
+
+        key, k_r, k_site = random.split(key, 3)
+
+        # random reflection direction
+        r = normalize(random.normal(k_r, shape=(3,), dtype=pos.dtype))
+
+        # random seed site
+        seed = random.randint(k_site, shape=(), minval=0, maxval=N)
+
+        projections = pos @ r
+
+        in_cluster, key = self._build_cluster(key, projections, beta_embed, seed)
+
+        reflected = pos - 2.0 * projections[:, None] * r[None, :]
+        prop = jnp.where(in_cluster[:, None], reflected, pos)
+        prop = project_to_sphere(prop)
+
+        delta_E = self._boundary_delta_E(pos, prop, in_cluster)
+
+        key, k_u = random.split(key)
+        log_new = log_psi_fn(prop)
+        log_u = jnp.log(random.uniform(k_u, shape=(), dtype=pos.dtype))
+
+        # Hastings-corrected accept ratio
+        log_accept = 2.0 * (log_new - log_pos) + beta_embed * delta_E
+        accept = log_u <= log_accept
+
+        pos = lax.select(accept, prop, pos)
+        log_pos = lax.select(accept, log_new, log_pos)
+        acc = acc + accept.astype(acc.dtype)
+
+        return (key, pos, log_pos, acc)
+
+    # --------------------------------------------------------------
+    # Single-chain run
+    # --------------------------------------------------------------
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
+    def run_chain(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initial, seed):
+        pos = project_to_sphere(jnp.asarray(pos_initial))
+        beta_embed = jnp.asarray(stepsize, dtype=pos.dtype)
+        key = random.PRNGKey(seed)
+
+        def log_psi_fn(x):
+            return jnp.reshape(
+                jnp.log(jnp.abs(self.psi(params, x)) + 1e-300),
+                ()
+            )
+
+        log_pos = log_psi_fn(pos)
+        acc0 = jnp.array(0, dtype=jnp.int32)
+
+        def therm_body(carry, _):
+            return self._cluster_step_rng(log_psi_fn, carry, beta_embed), None
+
+        (key, pos, log_pos, acc_therm), _ = lax.scan(
+            therm_body, (key, pos, log_pos, acc0), xs=None, length=Ntherm
+        )
+
+        def one_sweep(carry, _):
+            key, pos, log_pos, acc = carry
+
+            def one_keep_step(carry2, _):
+                return self._cluster_step_rng(log_psi_fn, carry2, beta_embed), None
+
+            (key, pos, log_pos, acc), _ = lax.scan(
+                one_keep_step, (key, pos, log_pos, acc), xs=None, length=keep
+            )
+            return (key, pos, log_pos, acc), pos
+
+        (key, pos, log_pos, acc_total), samples = lax.scan(
+            one_sweep, (key, pos, log_pos, acc0), xs=None, length=Nsweeps
+        )
+
+        total_steps = Ntherm + Nsweeps * keep
+        acc_rate = (acc_therm + acc_total) / jnp.asarray(total_steps, dtype=jnp.float32)
+        return samples, acc_rate
+
+    # --------------------------------------------------------------
+    # Original non-sharded multi-chain API
+    # --------------------------------------------------------------
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
+    def run_many_chains(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initials, seeds):
+        pos_initials = jnp.asarray(pos_initials)
+        seeds = jnp.asarray(seeds, dtype=jnp.uint32)
+
+        samples_per_chain, acc_rates = jax.vmap(
+            lambda pos0, sd: self.run_chain(
+                params, Nsweeps, Ntherm, keep, stepsize, pos0, sd
+            ),
+            in_axes=(0, 0),
+            out_axes=(0, 0),
+        )(pos_initials, seeds)
+
+        nchains = pos_initials.shape[0]
+        samples = samples_per_chain.reshape((nchains * Nsweeps,) + self.shape)
+        acc_rate = acc_rates.mean()
+        return samples, acc_rate
+
+    # --------------------------------------------------------------
+    # Sharded multi-chain kernel
+    # --------------------------------------------------------------
+    def _make_run_many_chains_sharded_kernel(self, Nsweeps, Ntherm, keep):
+        @partial(
+            shard_map.shard_map,
+            mesh=self.mesh,
+            in_specs=(P(), P("data", None, None), P("data",), P()),
+            out_specs=(P(), P()),
+            check_rep=False,
+        )
+        def _kernel(params, pos_initials, seeds, stepsize):
+            def run_local_chain(pos0, sd):
+                return self.run_chain(params, Nsweeps, Ntherm, keep, stepsize, pos0, sd)
+
+            samples_local, acc_rates_local = jax.vmap(
+                run_local_chain, in_axes=(0, 0), out_axes=(0, 0)
+            )(pos_initials, seeds)
+
+            samples_all = lax.all_gather(samples_local, "data", axis=0, tiled=True)
+            acc_rates_all = lax.all_gather(acc_rates_local, "data", axis=0, tiled=True)
+
+            nchains_total = samples_all.shape[0]
+            samples = samples_all.reshape((nchains_total * Nsweeps,) + self.shape)
+            acc_rate = jnp.mean(acc_rates_all)
+
+            return samples, acc_rate
+
+        return _kernel
+
+    # --------------------------------------------------------------
+    # Public sharded API
+    # --------------------------------------------------------------
+    def run_many_chains_shard(
+        self,
+        params,
+        Nsweeps,
+        Ntherm,
+        keep,
+        stepsize,
+        pos_initials,
+        seeds,
+    ):
+        """
+        Sharded multi-device variant.
+
+        Parameters
+        ----------
+        params : pytree
+            Replicated model parameters.
+        Nsweeps, Ntherm, keep : int
+            Same meanings as run_chain.
+        stepsize : scalar
+            Here interpreted as beta_embed for the cluster proposal.
+        pos_initials : array, shape (nchains, N, 3)
+        seeds : array, shape (nchains,)
+
+        Returns
+        -------
+        samples : array, shape (nchains * Nsweeps, N, 3)
+        acc_rate : scalar
+        """
+        pos_initials = jnp.asarray(pos_initials)
+        seeds = jnp.asarray(seeds, dtype=jnp.uint32)
+
+        nchains = pos_initials.shape[0]
+        ndev = self.mesh.devices.size
+
+        if nchains % ndev != 0:
+            raise ValueError(
+                f"nchains={nchains} must be divisible by number of devices={ndev}"
+            )
+
+        params = jax.device_put(params, self._replicated)
+        pos_initials = jax.device_put(pos_initials, self._chains_sharding)
+        seeds = jax.device_put(seeds, self._seeds_sharding)
+
+        kernel = self._make_run_many_chains_sharded_kernel(Nsweeps, Ntherm, keep)
+        stepsize = jnp.asarray(stepsize)
+        samples, acc_rate = kernel(params, pos_initials, seeds, stepsize)
+        return samples, acc_rate
