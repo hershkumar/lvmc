@@ -1,4 +1,5 @@
 import optax
+import jax
 from jax import numpy as jnp
 import numpy as np
 from observables import * 
@@ -24,6 +25,58 @@ example_MC_options = {
     "seeds": jnp.arange(16),
     "pos_initials": None,
 }
+
+
+def _run_sampler_sharded_aware(
+    sampler,
+    params,
+    Nsweeps,
+    Ntherm,
+    keep,
+    stepsize,
+    pos_initials,
+    seeds,
+    *,
+    return_last_pos=False,
+):
+    if return_last_pos and hasattr(sampler, "run_many_chains_shard_stateful"):
+        return sampler.run_many_chains_shard_stateful(
+            params,
+            Nsweeps,
+            Ntherm,
+            keep,
+            stepsize,
+            pos_initials,
+            seeds,
+        )
+
+    if hasattr(sampler, "run_many_chains_shard"):
+        samples, acc_rate = sampler.run_many_chains_shard(
+            params,
+            Nsweeps,
+            Ntherm,
+            keep,
+            stepsize,
+            pos_initials,
+            seeds,
+        )
+    else:
+        samples, acc_rate = sampler.run_many_chains(
+            jax.device_get(params),
+            Nsweeps,
+            Ntherm,
+            keep,
+            stepsize,
+            pos_initials,
+            seeds,
+        )
+
+    if not return_last_pos:
+        return samples, acc_rate
+
+    nchains = jnp.asarray(pos_initials).shape[0]
+    last_pos = samples.reshape((nchains, Nsweeps) + sampler.shape)[:, -1]
+    return samples, last_pos, acc_rate
 
 
 def train(results, model, eta, g, mu, sampler, MC_options, steps, lr, fig=None, batch_size=None, clip_threshold=None):
@@ -763,11 +816,9 @@ def train_adapt_shard(
 
     if not MC_options["chain"]:
         for step_num in pbar:
-            # sampler likely expects host/local params; replicate -> host view is fine
-            params_host = jax.device_get(params)
-
-            samples, accept_rate = sampler.run_many_chains(
-                params_host,
+            samples, accept_rate = _run_sampler_sharded_aware(
+                sampler,
+                params,
                 MC_options["num_samples"] // MC_options["nchains"],
                 MC_options["thermalization"],
                 MC_options["skip"],
@@ -807,27 +858,21 @@ def train_adapt_shard(
         prev_samples = MC_options["pos_initials"]
 
         for step_num in pbar:
-            params_host = jax.device_get(params)
-
-            samples, accept_rate = sampler.run_many_chains(
-                params_host,
+            samples, prev_samples, accept_rate = _run_sampler_sharded_aware(
+                sampler,
+                params,
                 MC_options["num_samples"] // MC_options["nchains"],
                 MC_options["thermalization"],
                 MC_options["skip"],
                 var_rad,
                 prev_samples,
                 MC_options["seeds"],
+                return_last_pos=True,
             )
 
             accept_rate = float(jnp.mean(accept_rate))
             var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
             var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
-
-            # chain continuation update happens on host/local samples before sharding
-            prev_samples = samples.reshape(
-                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
-                + sampler.shape
-            )[:, -1]
 
             samples = jax.device_put(samples, configs_sharding)
 
@@ -941,10 +986,9 @@ def sr_train_adapt_shard(
             global_step = prev_max_step + step_num
             damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
 
-            params_host = jax.device_get(params)
-
-            samples, accept_rate = sampler.run_many_chains(
-                params_host,
+            samples, accept_rate = _run_sampler_sharded_aware(
+                sampler,
+                params,
                 MC_options["num_samples"] // MC_options["nchains"],
                 MC_options["thermalization"],
                 MC_options["skip"],
@@ -1001,26 +1045,21 @@ def sr_train_adapt_shard(
             global_step = prev_max_step + step_num
             damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
 
-            params_host = jax.device_get(params)
-
-            samples, accept_rate = sampler.run_many_chains(
-                params_host,
+            samples, prev_samples, accept_rate = _run_sampler_sharded_aware(
+                sampler,
+                params,
                 MC_options["num_samples"] // MC_options["nchains"],
                 MC_options["thermalization"],
                 MC_options["skip"],
                 var_rad,
                 prev_samples,
                 MC_options["seeds"],
+                return_last_pos=True,
             )
 
             accept_rate = float(jnp.mean(accept_rate))
             var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
             var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
-
-            prev_samples = samples.reshape(
-                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
-                + sampler.shape
-            )[:, -1]
 
             samples = jax.device_put(samples, configs_sharding)
 
