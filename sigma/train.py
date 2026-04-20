@@ -16,7 +16,7 @@ import numpy as np
 import jax
 import jax.numpy as jnp
 
-from sampling import newSamplerSharded, ClusterSamplerSharded
+from sampling import newSamplerSharded, ClusterSamplerOptimized
 from wavefunction import GodSlayer3
 try:
     from wavefunction import GodSlayer3Excited
@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--cluster",
         action="store_true",
-        help="Use ClusterSamplerSharded for training. In this mode, var is forced to 1/g^2 and adapt_rate to 0.",
+        help="Use ClusterSamplerOptimized for training. In this mode, var is forced to 1/g^2 and adapt_rate to 0.",
     )
 
     # Training args
@@ -280,7 +280,7 @@ def main() -> None:
         init_source = "random_init"
 
     psi = jax.jit(model.apply)
-    sampler_cls = ClusterSamplerSharded if args.cluster else newSamplerSharded
+    sampler_cls = ClusterSamplerOptimized if args.cluster else newSamplerSharded
     sampler = sampler_cls(psi, (args.N, 3))
 
     mc_options = {
@@ -353,7 +353,7 @@ def main() -> None:
     )
 
     print("Starting post-training evaluation", flush=True)
-    eval_sampler = ClusterSamplerSharded(psi, (args.N, 3))
+    eval_sampler = ClusterSamplerOptimized(psi, (args.N, 3))
     eval_chains = args.eval_chains
     eval_sweeps_per_chain = max(1, args.eval_samples_total // eval_chains)
     eval_seed_base = seed + 1_000_000
