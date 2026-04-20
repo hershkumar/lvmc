@@ -1095,3 +1095,220 @@ class ClusterSamplerSharded:
         stepsize = jnp.asarray(stepsize)
         samples, acc_rate = kernel(params, pos_initials, seeds, stepsize)
         return samples, acc_rate
+
+
+
+
+
+### OPTIMIZED CLUSTER SAMPLER
+
+def project_to_sphere(x, eps=1e-12):
+    return normalize(x, eps=eps)
+
+
+class ClusterSamplerOptimized:
+    """
+    GPU-optimized 1D periodic nearest-neighbor cluster sampler.
+
+    Assumptions:
+      - shape == (N, 3)
+      - nearest-neighbor periodic chain
+      - cluster move is Wolff-style reflection
+      - psi(params, x) returns amplitude, not log amplitude
+    """
+
+    def __init__(self, psi, shape):
+        self.psi = psi
+        self.shape = tuple(shape)
+        if len(self.shape) != 2 or self.shape[1] != 3:
+            raise ValueError(f"Expected shape (N, 3), got {self.shape}")
+        self.N = self.shape[0]
+
+        i = jnp.arange(self.N, dtype=jnp.int32)
+        self.left = (i - 1) % self.N
+        self.right = (i + 1) % self.N
+
+    # --------------------------------------------------------------
+    # Numerically safer scalar log|psi|
+    # --------------------------------------------------------------
+    def _logabs_psi(self, params, x):
+        amp = self.psi(params, x)
+        tiny = jnp.finfo(jnp.asarray(amp).dtype).tiny
+        return jnp.reshape(jnp.log(jnp.maximum(jnp.abs(amp), tiny)), ())
+
+    # --------------------------------------------------------------
+    # Build seed connected component on 1D ring from sampled active bonds
+    # active_bonds[i] corresponds to edge (i, i+1 mod N)
+    # --------------------------------------------------------------
+    def _cluster_from_active_bonds(self, active_bonds, seed):
+        N = active_bonds.shape[0]
+        offs = jnp.arange(N, dtype=jnp.int32)
+    
+        # ---------- right side ----------
+        right_bonds = active_bonds[
+            (seed + jnp.arange(N - 1, dtype=jnp.int32)) % N
+        ].astype(jnp.int32)
+    
+        right_prefix = lax.associative_scan(
+            jnp.minimum,
+            right_bonds
+        )
+    
+        right_sites = jnp.concatenate(
+            [
+                jnp.ones((1,), dtype=jnp.int32),
+                right_prefix,
+            ],
+            axis=0,
+        )
+    
+        idx_r = (seed + offs) % N
+        mask_r = jnp.zeros((N,), dtype=jnp.int32).at[idx_r].set(right_sites)
+    
+        # ---------- left side ----------
+        left_bonds = active_bonds[
+            (seed - 1 - jnp.arange(N - 1, dtype=jnp.int32)) % N
+        ].astype(jnp.int32)
+    
+        left_prefix = lax.associative_scan(
+            jnp.minimum,
+            left_bonds
+        )
+    
+        left_sites = jnp.concatenate(
+            [
+                jnp.ones((1,), dtype=jnp.int32),
+                left_prefix,
+            ],
+            axis=0,
+        )
+    
+        idx_l = (seed - offs) % N
+        mask_l = jnp.zeros((N,), dtype=jnp.int32).at[idx_l].set(left_sites)
+    
+        return (mask_r | mask_l).astype(jnp.bool_)
+
+    # --------------------------------------------------------------
+    # Fully vectorized 1D cluster construction
+    # --------------------------------------------------------------
+    def _build_cluster_1d(self, key, projections, beta_embed, seed_site):
+        # bond i connects site i to i+1 mod N
+        prod = projections * projections[self.right]
+        p_bond = jnp.maximum(0.0, 1.0 - jnp.exp(-2.0 * beta_embed * prod))
+
+        key, k_bond = random.split(key)
+        u = random.uniform(k_bond, shape=(self.N,), dtype=projections.dtype)
+        active_bonds = u < p_bond
+
+        in_cluster = self._cluster_from_active_bonds(active_bonds, seed_site)
+        return in_cluster, key
+
+    # --------------------------------------------------------------
+    # Boundary energy difference for Hastings correction
+    # Keep your existing vectorized form; it is already decent.
+    # --------------------------------------------------------------
+    def _boundary_delta_E(self, pos, prop, in_cluster):
+        ic = in_cluster
+        pos_right = pos[self.right]
+        pos_left = pos[self.left]
+        diff = prop - pos
+
+        boundary_r = ic & (~ic[self.right])
+        boundary_l = ic & (~ic[self.left])
+
+        de_r = -jnp.sum(jnp.sum(diff * pos_right, axis=-1) * boundary_r)
+        de_l = -jnp.sum(jnp.sum(diff * pos_left, axis=-1) * boundary_l)
+
+        # Each boundary counted once from inside -> outside.
+        return de_r + de_l
+
+    # --------------------------------------------------------------
+    # One cluster MH step
+    # --------------------------------------------------------------
+    def _cluster_step_rng(self, params, carry, beta_embed):
+        key, pos, log_pos, acc = carry
+        N = pos.shape[0]
+
+        key, k_r, k_site, k_acc = random.split(key, 4)
+
+        r = normalize(random.normal(k_r, shape=(3,), dtype=pos.dtype))
+        seed = random.randint(k_site, shape=(), minval=0, maxval=N)
+
+        projections = pos @ r
+
+        # GPU-friendly vectorized cluster build
+        in_cluster, key = self._build_cluster_1d(key, projections, beta_embed, seed)
+
+        # Reflection preserves norm analytically; no reprojection needed in exact arithmetic.
+        reflected = pos - 2.0 * projections[:, None] * r[None, :]
+        prop = jnp.where(in_cluster[:, None], reflected, pos)
+
+        # Optional safety renorm every move if you need it:
+        # prop = project_to_sphere(prop)
+
+        delta_E = self._boundary_delta_E(pos, prop, in_cluster)
+
+        log_new = self._logabs_psi(params, prop)
+        log_u = jnp.log(random.uniform(k_acc, shape=(), dtype=pos.dtype))
+
+        log_accept = 2.0 * (log_new - log_pos) + beta_embed * delta_E
+        accept = log_u <= log_accept
+
+        pos = lax.select(accept, prop, pos)
+        log_pos = lax.select(accept, log_new, log_pos)
+        acc = acc + accept.astype(acc.dtype)
+
+        return key, pos, log_pos, acc
+
+    # --------------------------------------------------------------
+    # Single-chain run
+    # --------------------------------------------------------------
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
+    def run_chain(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initial, seed):
+        pos = project_to_sphere(jnp.asarray(pos_initial))
+        beta_embed = jnp.asarray(stepsize, dtype=pos.dtype)
+        key = random.PRNGKey(seed)
+
+        log_pos = self._logabs_psi(params, pos)
+        acc0 = jnp.array(0, dtype=jnp.int32)
+
+        def therm_body(carry, _):
+            return self._cluster_step_rng(params, carry, beta_embed), None
+
+        (key, pos, log_pos, acc_therm), _ = lax.scan(
+            therm_body, (key, pos, log_pos, acc0), xs=None, length=Ntherm
+        )
+
+        def one_sweep(carry, _):
+            def one_keep_step(carry2, _):
+                return self._cluster_step_rng(params, carry2, beta_embed), None
+
+            carry, _ = lax.scan(one_keep_step, carry, xs=None, length=keep)
+            return carry, carry[1]  # pos
+
+        (key, pos, log_pos, acc_total), samples = lax.scan(
+            one_sweep, (key, pos, log_pos, acc0), xs=None, length=Nsweeps
+        )
+
+        total_steps = Ntherm + Nsweeps * keep
+        acc_rate = (acc_therm + acc_total) / jnp.asarray(total_steps, dtype=jnp.float32)
+        return samples, acc_rate
+
+    # --------------------------------------------------------------
+    # Batched chains on one device (usually best starting point for GPU)
+    # --------------------------------------------------------------
+    @partial(jax.jit, static_argnums=(0, 2, 3, 4))
+    def run_many_chains(self, params, Nsweeps, Ntherm, keep, stepsize, pos_initials, seeds):
+        pos_initials = jnp.asarray(pos_initials)
+        seeds = jnp.asarray(seeds, dtype=jnp.uint32)
+
+        samples_per_chain, acc_rates = jax.vmap(
+            lambda pos0, sd: self.run_chain(params, Nsweeps, Ntherm, keep, stepsize, pos0, sd),
+            in_axes=(0, 0),
+            out_axes=(0, 0),
+        )(pos_initials, seeds)
+
+        nchains = pos_initials.shape[0]
+        samples = samples_per_chain.reshape((nchains * Nsweeps,) + self.shape)
+        acc_rate = acc_rates.mean()
+        return samples, acc_rate
