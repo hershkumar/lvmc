@@ -180,7 +180,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument(
         "--energy-batchsize",
         type=positive_int,
-        default=8,
+        default=20000,
         help="Batch size for batched final energy computation",
     )
 
