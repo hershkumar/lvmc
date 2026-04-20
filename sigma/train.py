@@ -118,6 +118,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Use GodSlayer3Excited instead of GodSlayer3.",
     )
+    p.add_argument(
+        "--cluster",
+        action="store_true",
+        help="Use ClusterSamplerSharded for training. In this mode, var is forced to 1/g^2 and adapt_rate to 0.",
+    )
 
     # Training args
     p.add_argument("--samples", type=positive_int, required=True, help="Number of MC samples per step")
@@ -217,6 +222,8 @@ def make_run_name(args: argparse.Namespace) -> str:
     )
     if args.excited:
         base += "_excited"
+    if args.cluster:
+        base += "_cluster"
     if args.tag:
         base += f"_{args.tag}"
     return base.replace("/", "-")
@@ -236,6 +243,8 @@ def main() -> None:
     seed = args.seed if args.seed is not None else int(time.time())
     g = float(np.sqrt(args.g2))
     residual_scale = args.residual_scale if args.residual_scale is not None else 0.25 / args.layers
+    training_var = (1.0 / args.g2) if args.cluster else args.var
+    training_adapt_rate = 0.0 if args.cluster else args.adapt_rate
 
     jax.config.update("jax_enable_x64", False)
 
@@ -271,13 +280,14 @@ def main() -> None:
         init_source = "random_init"
 
     psi = jax.jit(model.apply)
-    sampler = newSamplerSharded(psi, (args.N, 3))
+    sampler_cls = ClusterSamplerSharded if args.cluster else newSamplerSharded
+    sampler = sampler_cls(psi, (args.N, 3))
 
     mc_options = {
         "num_samples": args.samples,
         "thermalization": args.thermal,
         "skip": args.skip,
-        "var": args.var,
+        "var": training_var,
         "nchains": args.nchains,
         "seeds": [seed + i for i in range(args.nchains)],
         "pos_initials": gen_init_positions(args.nchains, args.N, seed + 10_000),
@@ -298,6 +308,7 @@ def main() -> None:
     print(f"layers            : {args.layers}")
     print(f"neighbors         : {args.neighbors}")
     print(f"model             : {model_cls.__name__}")
+    print(f"training sampler  : {sampler_cls.__name__}")
     print(f"mlp hidden sizes  : {tuple(args.mlp)}")
     print(f"residual_scale    : {residual_scale}")
     print(f"samples           : {args.samples}")
@@ -307,8 +318,8 @@ def main() -> None:
     print(f"steps             : {args.steps}")
     print(f"lr                : {args.lr}")
     print(f"batchsize         : {args.batchsize}")
-    print(f"var               : {args.var}")
-    print(f"adapt_rate        : {args.adapt_rate}")
+    print(f"var               : {training_var}")
+    print(f"adapt_rate        : {training_adapt_rate}")
     print(f"init source       : {init_source}")
     print(f"parameter count   : {count_flax_params(params)}")
     print("=" * 80, flush=True)
@@ -325,7 +336,7 @@ def main() -> None:
         args.steps,
         args.lr,
         fig=None,
-        adapt_rate=args.adapt_rate,
+        adapt_rate=training_adapt_rate,
         batch_size=args.batchsize,
     )
     wall_s = time.time() - t0
@@ -390,7 +401,11 @@ def main() -> None:
     config["g"] = g
     config["excited"] = bool(args.excited)
     config["model_class"] = model_cls.__name__
+    config["cluster"] = bool(args.cluster)
+    config["training_sampler_class"] = sampler_cls.__name__
     config["residual_scale_resolved"] = residual_scale
+    config["var_resolved"] = training_var
+    config["adapt_rate_resolved"] = training_adapt_rate
     config["seed_resolved"] = seed
     config["parameter_count"] = count_flax_params(final_params)
     config["wall_seconds"] = wall_s
@@ -418,6 +433,8 @@ def main() -> None:
         "neighbors": args.neighbors,
         "model_class": model_cls.__name__,
         "excited": bool(args.excited),
+        "cluster": bool(args.cluster),
+        "training_sampler_class": sampler_cls.__name__,
         "mlp": "x".join(str(x) for x in args.mlp),
         "samples": args.samples,
         "thermal": args.thermal,
@@ -426,8 +443,8 @@ def main() -> None:
         "nchains": args.nchains,
         "steps": args.steps,
         "batchsize": args.batchsize,
-        "var": args.var,
-        "adapt_rate": args.adapt_rate,
+        "var": training_var,
+        "adapt_rate": training_adapt_rate,
         "parameter_count": count_flax_params(final_params),
         "wall_seconds": wall_s,
         "training_final_energy": float(energies[-1]) if len(energies) else "",
