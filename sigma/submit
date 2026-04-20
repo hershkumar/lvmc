@@ -1,0 +1,15 @@
+#!/bin/bash
+
+#SBATCH --job-name=lvmc-g2-.5
+#SBATCH --partition=gpu
+#SBATCH --gpus=a100:3
+#SBATCH --cpus-per-task=1
+#SBATCH --mem=64G
+#SBATCH --time=3:00:00
+#SBATCH --output=slurm-%j.out
+
+
+module purge 
+source /home/hekumar/scratch.bedaque-prj/lvmc/.venv/bin/activate
+
+python -u train.py --N 40 --g2 .65 --channels 1 --layers 5 --neighbors 20 --mlp 40 --samples 60000 --thermal 10000 --skip 10 --lr .1 --nchains 60 --steps 500 --batchsize 60000
