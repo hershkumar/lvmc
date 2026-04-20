@@ -18,6 +18,10 @@ import jax.numpy as jnp
 
 from sampling import newSamplerSharded, ClusterSamplerSharded
 from wavefunction import GodSlayer3
+try:
+    from wavefunction import GodSlayer3Excited
+except ImportError:
+    GodSlayer3Excited = None
 from training import sr_train_adapt_shard
 from observables import batched_energy, Cr_with_cov_optimized
 
@@ -108,6 +112,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="Residual scale. Default: 0.25 / layers, matching the notebook.",
+    )
+    p.add_argument(
+        "--excited",
+        action="store_true",
+        help="Use GodSlayer3Excited instead of GodSlayer3.",
     )
 
     # Training args
@@ -206,6 +215,8 @@ def make_run_name(args: argparse.Namespace) -> str:
         f"_neighbors_{args.neighbors}_mlp_{mlp_str}"
         f"_samples_{args.samples}_steps_{args.steps}"
     )
+    if args.excited:
+        base += "_excited"
     if args.tag:
         base += f"_{args.tag}"
     return base.replace("/", "-")
@@ -238,7 +249,13 @@ def main() -> None:
 
     x_init = np.random.default_rng(seed).normal(size=(args.N, 3)).astype(np.float32)
 
-    model = GodSlayer3(
+    model_cls = GodSlayer3Excited if args.excited else GodSlayer3
+    if args.excited and GodSlayer3Excited is None:
+        raise ImportError(
+            "--excited was requested, but GodSlayer3Excited could not be imported from wavefunction.py"
+        )
+
+    model = model_cls(
         num_layers=args.layers,
         num_channels=args.channels,
         num_neighbors=args.neighbors,
@@ -280,6 +297,7 @@ def main() -> None:
     print(f"channels          : {args.channels}")
     print(f"layers            : {args.layers}")
     print(f"neighbors         : {args.neighbors}")
+    print(f"model             : {model_cls.__name__}")
     print(f"mlp hidden sizes  : {tuple(args.mlp)}")
     print(f"residual_scale    : {residual_scale}")
     print(f"samples           : {args.samples}")
@@ -370,6 +388,8 @@ def main() -> None:
     config["outdir"] = str(args.outdir)
     config["init_params"] = None if args.init_params is None else str(args.init_params)
     config["g"] = g
+    config["excited"] = bool(args.excited)
+    config["model_class"] = model_cls.__name__
     config["residual_scale_resolved"] = residual_scale
     config["seed_resolved"] = seed
     config["parameter_count"] = count_flax_params(final_params)
@@ -396,6 +416,8 @@ def main() -> None:
         "channels": args.channels,
         "layers": args.layers,
         "neighbors": args.neighbors,
+        "model_class": model_cls.__name__,
+        "excited": bool(args.excited),
         "mlp": "x".join(str(x) for x in args.mlp),
         "samples": args.samples,
         "thermal": args.thermal,
