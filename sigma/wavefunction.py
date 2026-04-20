@@ -662,6 +662,100 @@ class GodSlayer3(nn.Module):
         return jnp.exp(-out)
 
 
+
+
+
+
+class GodSlayer3Excited(nn.Module):
+    num_layers: int = 1
+    num_neighbors: int = 1
+    num_channels: int = 1
+    mlp_hidden_sizes: Sequence[int] = (64, 64)
+    mlp_activation: Callable = nn.celu
+    param_dtype: jnp.dtype = jnp.float32
+    residual_scale: float = 1.0
+
+    @staticmethod
+    def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
+        return jnp.einsum("...ia,...ja->...ij", n, n)
+
+    @staticmethod
+    def godslayer_laplacian_init(
+        num_layers, num_neighbors,
+        self_val=-0.15, neigh_val=0.04, noise=0.05
+    ):
+        def init(key, shape, dtype=jnp.float32):
+            L, C, K = shape
+            depth = jnp.sqrt(float(num_layers))
+            neigh = jnp.sqrt(float(max(1, num_neighbors)))
+            w = jnp.zeros(shape, dtype=dtype)
+            w = w.at[:, :, 0].set(self_val / depth)
+            if num_neighbors > 0:
+                w = w.at[:, :, 1:].set(neigh_val / (depth * neigh))
+            if noise > 0:
+                w = w + noise * jax.random.normal(key, shape, dtype)
+            return w
+        return init
+
+    @staticmethod
+    def separation_readout_fast(h: jnp.ndarray) -> jnp.ndarray:
+        L = h.shape[-3]
+        i = jnp.arange(L)
+        r = jnp.arange(L)
+        j = (i[:, None] + r[None, :]) % L
+        vals = h[..., i[:, None], j, :]     # (..., L, L, C)
+        return jnp.mean(vals, axis=-3)      # (..., L, C)
+
+    def setup(self):
+        self.weights = self.param(
+            "weights",
+            self.godslayer_laplacian_init(self.num_layers, self.num_neighbors),
+            (self.num_layers, self.num_channels, self.num_neighbors + 1),
+            self.param_dtype,
+        )
+        self._fused_stack = make_godslayer2_fused_stack_nhwc_fast(self.num_neighbors)
+
+        self.mlp_layers = [
+            nn.Dense(width, param_dtype=self.param_dtype)
+            for width in self.mlp_hidden_sizes
+        ]
+        self.out_layer = nn.Dense(1, param_dtype=self.param_dtype)
+
+    @nn.compact
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        if n.shape[-1] != 3:
+            raise ValueError(f"Expected (..., L, 3), got {n.shape}")
+
+        L = n.shape[-2]
+        dtype = self.param_dtype
+        
+        g = self.gram_matrix(n).astype(dtype)
+        g = g * (1.0 - jnp.eye(L, dtype=dtype))
+
+        x0 = jnp.broadcast_to(
+            g[..., :, :, None],
+            g.shape[:-2] + (L, L, self.num_channels),
+        )
+
+        h = self._fused_stack(
+            x0,
+            self.weights,
+            jnp.asarray(self.residual_scale, dtype=dtype),
+        )
+
+        c = self.separation_readout_fast(h)
+        feat = c.reshape(*c.shape[:-2], -1)
+
+        y = feat
+        for dense in self.mlp_layers:
+            y = dense(y)
+            y = self.mlp_activation(y)
+
+        out = jnp.squeeze(self.out_layer(y), axis=-1)
+        Oz = jnp.sum(n, axis=-2)[..., 2]
+        return jnp.exp(-out) * Oz
+
+
 def canonicalize_so3_fast(n, eps=1e-15):
     """
     Same constraints as your canonicalize_so3, but avoids atan2/cos/sin composition.
