@@ -3,6 +3,10 @@ from jax import numpy as jnp
 import numpy as np
 from observables import * 
 from tqdm import trange
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
+from IPython.display import display
+
 
 # =============
 # Gradient Descent Methods
@@ -1060,3 +1064,290 @@ def sr_train_adapt_shard(
                 avg_uncerts.append(uncert_host)
 
     return params, avg_energies, avg_uncerts
+
+#### UPDATED TRAINING, stores all parameters
+
+def sr_train_adapt_shard(
+    results,
+    model,
+    eta,
+    g,
+    mu,
+    sampler,
+    MC_options,
+    steps,
+    lr,
+    damping_init=0.1,
+    damping_final=1e-3,
+    damping_decay=0.05,
+    target_accept=0.50,
+    adapt_rate=0.05,
+    fig=None,
+    batch_size=None,
+    clip_threshold=1.0,
+    mesh=None,
+):
+    if mesh is None:
+        mesh = make_data_mesh()
+
+    replicated = NamedSharding(mesh, P())
+    configs_sharding = NamedSharding(mesh, P("data", None, None))
+
+    # Chaining convention:
+    # results = (final_params, energies, uncerts)
+    # or
+    # results = (final_params, energies, uncerts, params_history)
+    example_params = results[0]
+    pytree_to_vec, vec_to_pytree, n_params, _ = make_param_vectorizer(example_params)
+
+    sr_dense_stats_sharded_fn = make_sr_dense_stats_sharded(
+        model, eta, g, mu, mesh, example_params, batch_size=batch_size
+    )
+
+    # This ensures chained calls start from the final params of the previous call.
+    params = jax.device_put(results[0], replicated)
+
+    avg_energies = list(results[1])
+    avg_uncerts = list(results[2])
+
+    if len(results) >= 4:
+        params_history = list(results[3])
+    else:
+        params_history = []
+
+    step_nums = list(np.arange(len(avg_energies)))
+
+    var_rad = float(MC_options["var"])
+
+    def push_point(fig, step, e, s):
+        e_host = float(jax.device_get(e))
+        s_host = float(jax.device_get(s))
+
+        step_nums.append(step)
+        avg_energies.append(e_host)
+        avg_uncerts.append(s_host)
+
+        steps_arr = np.asarray(step_nums)
+        E_arr = np.asarray(avg_energies)
+        sig_arr = np.asarray(avg_uncerts)
+
+        with fig.batch_update():
+            fig.data[0].x = list(steps_arr)
+            fig.data[0].y = list(E_arr)
+
+            fig.data[1].x = list(steps_arr)
+            fig.data[1].y = list(E_arr + sig_arr)
+
+            fig.data[2].x = list(steps_arr)
+            fig.data[2].y = list(E_arr - sig_arr)
+
+    # Use +1 so chained calls do not repeat the final previous step.
+    prev_max_step = step_nums[-1] + 1 if step_nums else 0
+
+    pbar = trange(steps, desc="", leave=True, ncols=300)
+
+    if not MC_options["chain"]:
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(
+                global_step,
+                damping_init,
+                damping_final,
+                damping_decay,
+            )
+
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                MC_options["pos_initials"],
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            samples = jax.device_put(samples, configs_sharding)
+
+            params, energy, uncert, info = sr_step_shard(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                mesh,
+                example_params=example_params,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+                sr_dense_stats_sharded_fn=sr_dense_stats_sharded_fn,
+                pytree_to_vec=pytree_to_vec,
+                vec_to_pytree=vec_to_pytree,
+                n_params=n_params,
+            )
+
+            # Store params after every update.
+            params_history.append(jax.device_get(params))
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | solver = dense | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                step_nums.append(global_step)
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+    else:
+        prev_samples = MC_options["pos_initials"]
+
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(
+                global_step,
+                damping_init,
+                damping_final,
+                damping_decay,
+            )
+
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                prev_samples,
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            prev_samples = samples.reshape(
+                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
+                + sampler.shape
+            )[:, -1]
+
+            samples = jax.device_put(samples, configs_sharding)
+
+            params, energy, uncert, info = sr_step_shard(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                mesh,
+                example_params=example_params,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+                sr_dense_stats_sharded_fn=sr_dense_stats_sharded_fn,
+                pytree_to_vec=pytree_to_vec,
+                vec_to_pytree=vec_to_pytree,
+                n_params=n_params,
+            )
+
+            # Store params after every update.
+            params_history.append(jax.device_get(params))
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | solver = dense | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                step_nums.append(global_step)
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+    return params, avg_energies, avg_uncerts, params_history
+
+
+
+
+
+def make_training_figure():
+    base = make_subplots(specs=[[{"secondary_y": False}]])
+
+    # Main energy trace
+    base.add_trace(
+        go.Scatter(
+            name="Energy",
+            mode="lines+markers",
+            x=[],
+            y=[],
+            line=dict(width=2),
+        ),
+        secondary_y=False,
+    )
+
+    # Upper boundary (hidden line)
+    base.add_trace(
+        go.Scatter(
+            name="E + σ",
+            mode="lines",
+            x=[],
+            y=[],
+            line=dict(width=0),
+            showlegend=False,
+            hoverinfo="skip",
+        ),
+        secondary_y=False,
+    )
+
+    # Lower boundary with fill to previous trace
+    base.add_trace(
+        go.Scatter(
+            name="Energy ± σ",
+            mode="lines",
+            x=[],
+            y=[],
+            line=dict(width=0),
+            fill="tonexty",
+            fillcolor="rgba(0,100,255,0.18)",
+            hoverinfo="skip",
+        ),
+        secondary_y=False,
+    )
+
+    
+
+    base.update_xaxes(title_text="Training step")
+    base.update_yaxes(title_text="Energy", secondary_y=False)
+
+    base.update_layout(
+        width=1000,
+        height=450,
+        showlegend=True,
+        uirevision=True,
+        template="plotly_white",
+    )
+
+    return go.FigureWidget(base)
