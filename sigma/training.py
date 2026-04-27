@@ -1590,7 +1590,7 @@ def sr_train_adapt_masked(
             global_step = prev_max_step + step_num
             damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
 
-            samples, accept_rate = sampler.run_many_chains(
+            samples, accept_rate = sampler.run_many_chains_shard(
                 params,
                 MC_options["num_samples"] // MC_options["nchains"],
                 MC_options["thermalization"],
@@ -1898,7 +1898,7 @@ def sr_train_adapt_shard_masked(
 
             params_host = jax.device_get(params)
 
-            samples, accept_rate = sampler.run_many_chains(
+            samples, accept_rate = sampler.run_many_chains_shard(
                 params_host,
                 MC_options["num_samples"] // MC_options["nchains"],
                 MC_options["thermalization"],
