@@ -1290,6 +1290,744 @@ def sr_train_adapt_shard(
     return params, avg_energies, avg_uncerts, params_history
 
 
+# ============================================================
+# Masked / frozen-parameter helpers
+# ============================================================
+
+def gs3_tree_zeros_bool_like(tree):
+    return jax.tree_util.tree_map(lambda x: jnp.zeros_like(x, dtype=bool), tree)
+
+
+def gs3_tree_ones_bool_like(tree):
+    return jax.tree_util.tree_map(lambda x: jnp.ones_like(x, dtype=bool), tree)
+
+
+def gs3_mask_tree(tree, mask):
+    return jax.tree_util.tree_map(
+        lambda x, m: jnp.where(m, x, jnp.zeros_like(x)),
+        tree,
+        mask,
+    )
+
+
+def gs3_restore_frozen_params(new_params, old_params, train_mask):
+    """
+    Guarantees frozen entries are exactly unchanged.
+    """
+    return jax.tree_util.tree_map(
+        lambda new, old, m: jnp.where(m, new, old),
+        new_params,
+        old_params,
+        train_mask,
+    )
+
+
+def gs3_make_train_mask(
+    params,
+    *,
+    train_layers=None,
+    train_channels=None,
+    train_terms=None,
+    train_weights=True,
+    train_mlp=True,
+):
+    """
+    Make a Boolean mask with the same pytree structure as params.
+
+    For GodSlayer3:
+        params["params"]["weights"].shape
+            = (num_layers, num_channels, num_neighbors + 1)
+
+    term convention:
+        term 0 = self term
+        term 1 = nearest-neighbor term
+        term 2 = next-nearest-neighbor term
+        ...
+    """
+    mask = gs3_tree_zeros_bool_like(params)
+
+    # Your code stores params as full Flax variables:
+    #     params["params"]["weights"]
+    # not raw params["weights"].
+    if "params" in params:
+        p = params["params"]
+        m = mask["params"]
+    else:
+        p = params
+        m = mask
+
+    if train_weights:
+        if "weights" not in p:
+            raise KeyError("Could not find GodSlayer3 weights at params['params']['weights'] or params['weights'].")
+
+        w_shape = p["weights"].shape
+        n_layers, n_channels, n_terms = w_shape
+
+        layers = jnp.arange(n_layers) if train_layers is None else jnp.asarray(train_layers)
+        channels = jnp.arange(n_channels) if train_channels is None else jnp.asarray(train_channels)
+        terms = jnp.arange(n_terms) if train_terms is None else jnp.asarray(train_terms)
+
+        wmask = jnp.zeros(w_shape, dtype=bool)
+        wmask = wmask.at[
+            layers[:, None, None],
+            channels[None, :, None],
+            terms[None, None, :],
+        ].set(True)
+
+        m["weights"] = wmask
+
+    if train_mlp:
+        for name in m.keys():
+            if name != "weights":
+                m[name] = jax.tree_util.tree_map(
+                    lambda x: jnp.ones_like(x, dtype=bool),
+                    m[name],
+                )
+
+    return mask
+
+
+def gs3_make_new_only_mask(
+    old_params,
+    new_params,
+    *,
+    train_new_layers=True,
+    train_new_channels=True,
+    train_mlp=False,
+):
+    """
+    Mask for transfer-learning runs.
+
+    Old block is frozen.
+    Newly added layers/channels are trainable.
+    """
+    mask = gs3_tree_zeros_bool_like(new_params)
+
+    old_p = old_params["params"] if "params" in old_params else old_params
+    new_p = new_params["params"] if "params" in new_params else new_params
+    m = mask["params"] if "params" in mask else mask
+
+    old_L, old_C, old_K = old_p["weights"].shape
+    new_L, new_C, new_K = new_p["weights"].shape
+
+    if old_K != new_K:
+        raise ValueError(
+            f"Cannot make new-only mask across changed num_neighbors: old K={old_K}, new K={new_K}."
+        )
+
+    wmask = jnp.zeros_like(new_p["weights"], dtype=bool)
+
+    if train_new_layers and new_L > old_L:
+        wmask = wmask.at[old_L:new_L, :, :].set(True)
+
+    if train_new_channels and new_C > old_C:
+        wmask = wmask.at[:, old_C:new_C, :].set(True)
+
+    m["weights"] = wmask
+
+    if train_mlp:
+        for name in m.keys():
+            if name != "weights":
+                m[name] = jax.tree_util.tree_map(
+                    lambda x: jnp.ones_like(x, dtype=bool),
+                    m[name],
+                )
+
+    return mask
+
+
+def gs3_count_trainable_params(train_mask):
+    leaves = jax.tree_util.tree_leaves(train_mask)
+    return int(sum(np.asarray(x).sum() for x in leaves))
+
+
+def gs3_check_frozen_unchanged(old_params, new_params, train_mask):
+    """
+    Returns max absolute change among frozen parameters.
+    Should be exactly 0.0 up to device/host transfer behavior.
+    """
+    diffs = jax.tree_util.tree_map(
+        lambda old, new, m: jnp.max(jnp.abs(jnp.where(m, 0.0, new - old))),
+        old_params,
+        new_params,
+        train_mask,
+    )
+    return max(float(jax.device_get(x)) for x in jax.tree_util.tree_leaves(diffs))
+
+
+def sr_step_masked(
+    model,
+    eta,
+    g_coup,
+    mu,
+    params,
+    configs,
+    lr,
+    train_mask=None,
+    damping=1e-3,
+    cg_tol=1e-6,
+    cg_maxiter=200,
+    clip_threshold=1.0,
+    batch_size=None,
+):
+    """
+    Masked matrix-free SR step.
+
+    If train_mask is not None, solve only in the trainable subspace:
+        delta_A = (S_AA + damping I)^(-1) grad_A
+        delta_F = 0
+    """
+    grad, logs_centered, E, uncert = sr_stats(
+        model, eta, g_coup, mu, params, configs, batch_size
+    )
+
+    if train_mask is None:
+        def matvec(v):
+            return add_damping(fisher_matvec(logs_centered, v), v, damping)
+
+        b = grad
+
+    else:
+        grad = gs3_mask_tree(grad, train_mask)
+
+        def matvec(v):
+            # Restrict input vector to active subspace.
+            v_active = gs3_mask_tree(v, train_mask)
+
+            Sv = fisher_matvec(logs_centered, v_active)
+            Av_active = add_damping(Sv, v_active, damping)
+
+            # Frozen block acts like identity, so CG has a well-defined full-space operator.
+            Av = jax.tree_util.tree_map(
+                lambda active_part, v_leaf, m: jnp.where(m, active_part, v_leaf),
+                Av_active,
+                v,
+                train_mask,
+            )
+            return Av
+
+        b = grad
+
+    delta, info = jax.scipy.sparse.linalg.cg(
+        A=matvec,
+        b=b,
+        tol=cg_tol,
+        maxiter=cg_maxiter,
+    )
+
+    if train_mask is not None:
+        delta = gs3_mask_tree(delta, train_mask)
+
+    if clip_threshold is not None:
+        delta_norm = jnp.sqrt(pytree_dot(delta, delta))
+        scale = jnp.minimum(1.0, clip_threshold / (delta_norm + 1e-12))
+        delta = pytree_mult(scale, delta)
+
+    old_params = params
+    new_params = jax.tree_util.tree_map(lambda p, d: p - lr * d, params, delta)
+
+    if train_mask is not None:
+        new_params = gs3_restore_frozen_params(new_params, old_params, train_mask)
+
+    return new_params, E, uncert, info
+
+
+def sr_train_adapt_masked(
+    results,
+    model,
+    eta,
+    g,
+    mu,
+    sampler,
+    MC_options,
+    steps,
+    lr,
+    train_mask=None,
+    damping_init=0.1,
+    damping_final=1e-3,
+    damping_decay=0.05,
+    target_accept=0.50,
+    adapt_rate=0.05,
+    fig=None,
+    batch_size=None,
+    clip_threshold=1.0,
+):
+    """
+    Same as sr_train_adapt, but with optional parameter freezing via train_mask.
+    """
+    params = results[0]
+    step_nums = list(np.arange(len(results[1])))
+    avg_energies = results[1]
+    avg_uncerts = results[2]
+
+    var_rad = float(MC_options["var"])
+
+    def push_point(fig, step, e, s):
+        step_nums.append(step)
+        avg_energies.append(e)
+        avg_uncerts.append(s)
+
+        steps_arr = jnp.asarray(step_nums)
+        E_arr = jnp.asarray(avg_energies)
+        sig_arr = jnp.asarray(avg_uncerts)
+
+        with fig.batch_update():
+            fig.data[0].x = steps_arr
+            fig.data[0].y = E_arr
+            fig.data[1].x = steps_arr
+            fig.data[1].y = E_arr + sig_arr
+            fig.data[2].x = steps_arr
+            fig.data[2].y = E_arr - sig_arr
+
+    prev_max_step = step_nums[-1] if step_nums else 0
+    pbar = trange(steps, desc="", leave=True, ncols=300)
+
+    if train_mask is not None:
+        print(f"Trainable parameters: {gs3_count_trainable_params(train_mask)}")
+
+    if not MC_options["chain"]:
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                MC_options["pos_initials"],
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            params, energy, uncert, info = sr_step_masked(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                train_mask=train_mask,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+            )
+
+            pbar.set_description(
+                f"E/N = {energy / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | cg = {info} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                avg_energies.append(energy)
+                avg_uncerts.append(uncert)
+
+    else:
+        prev_samples = MC_options["pos_initials"]
+
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(global_step, damping_init, damping_final, damping_decay)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                prev_samples,
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            params, energy, uncert, info = sr_step_masked(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                train_mask=train_mask,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+            )
+
+            pbar.set_description(
+                f"E/N = {energy / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | cg = {info} | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                avg_energies.append(energy)
+                avg_uncerts.append(uncert)
+
+            prev_samples = samples.reshape(
+                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
+                + sampler.shape
+            )[:, -1]
+
+    return params, avg_energies, avg_uncerts
+
+
+def gs3_solve_dense_spd(A, b):
+    """
+    SPD solve using Cholesky. Local replacement so we do not rely on underscored
+    helper imports from observables.py.
+    """
+    L = jnp.linalg.cholesky(A)
+    y = lax.linalg.triangular_solve(
+        L,
+        b[:, None],
+        left_side=True,
+        lower=True,
+    )
+    x = lax.linalg.triangular_solve(
+        L,
+        y,
+        left_side=True,
+        lower=True,
+        transpose_a=True,
+    )
+    return x[:, 0]
+
+
+def sr_step_shard_masked(
+    model,
+    eta,
+    g_coup,
+    mu,
+    params,
+    configs_sharded,
+    lr,
+    mesh,
+    example_params,
+    train_mask=None,
+    damping=1e-3,
+    clip_threshold=1.0,
+    batch_size=None,
+    sr_dense_stats_sharded_fn=None,
+    pytree_to_vec=None,
+    vec_to_pytree=None,
+    n_params=None,
+):
+    """
+    Masked dense sharded SR step.
+
+    Correct constrained system:
+        (S_AA + damping I) delta_A = grad_A
+        delta_F = 0
+
+    This is better than solving full SR and zeroing frozen entries afterwards.
+    """
+    if pytree_to_vec is None or vec_to_pytree is None or n_params is None:
+        pytree_to_vec, vec_to_pytree, n_params, _ = make_param_vectorizer(example_params)
+
+    if sr_dense_stats_sharded_fn is None:
+        sr_dense_stats_sharded_fn = make_sr_dense_stats_sharded(
+            model,
+            eta,
+            g_coup,
+            mu,
+            mesh,
+            example_params,
+            batch_size=batch_size,
+        )
+
+    grad_vec, S, E, uncert = sr_dense_stats_sharded_fn(params, configs_sharded)
+
+    eye = jnp.eye(n_params, dtype=S.dtype)
+
+    if train_mask is None:
+        active_vec = jnp.ones((n_params,), dtype=S.dtype)
+        A = S + damping * eye
+        b = grad_vec
+
+    else:
+        mask_vec = pytree_to_vec(train_mask).astype(bool)
+        active_vec = mask_vec.astype(S.dtype)
+
+        active_outer = active_vec[:, None] * active_vec[None, :]
+
+        # Active block gets SR matrix + damping.
+        A_active = (S + damping * eye) * active_outer
+
+        # Frozen block gets identity so the full matrix remains SPD.
+        A_frozen = eye * (1.0 - active_vec)
+
+        A = A_active + A_frozen
+        b = grad_vec * active_vec
+
+    delta_vec = gs3_solve_dense_spd(A, b)
+    delta_vec = delta_vec * active_vec
+
+    if clip_threshold is not None:
+        delta_norm = jnp.linalg.norm(delta_vec)
+        scale = jnp.minimum(1.0, clip_threshold / (delta_norm + 1e-12))
+        delta_vec = delta_vec * scale
+
+    delta = vec_to_pytree(delta_vec)
+
+    old_params = params
+    new_params = jax.tree_util.tree_map(lambda p, d: p - lr * d, params, delta)
+
+    if train_mask is not None:
+        new_params = gs3_restore_frozen_params(new_params, old_params, train_mask)
+
+    info = jnp.asarray(0, dtype=jnp.int32)
+    return new_params, E, uncert, info
+
+
+def sr_train_adapt_shard_masked(
+    results,
+    model,
+    eta,
+    g,
+    mu,
+    sampler,
+    MC_options,
+    steps,
+    lr,
+    train_mask=None,
+    damping_init=0.1,
+    damping_final=1e-3,
+    damping_decay=0.05,
+    target_accept=0.50,
+    adapt_rate=0.05,
+    fig=None,
+    batch_size=None,
+    clip_threshold=1.0,
+    mesh=None,
+):
+    """
+    Same as your latest sr_train_adapt_shard, but with optional train_mask.
+
+    Returns:
+        params, avg_energies, avg_uncerts, params_history
+    """
+    if mesh is None:
+        mesh = make_data_mesh()
+
+    replicated = NamedSharding(mesh, P())
+    configs_sharding = NamedSharding(mesh, P("data", None, None))
+
+    example_params = results[0]
+    pytree_to_vec, vec_to_pytree, n_params, _ = make_param_vectorizer(example_params)
+
+    sr_dense_stats_sharded_fn = make_sr_dense_stats_sharded(
+        model,
+        eta,
+        g,
+        mu,
+        mesh,
+        example_params,
+        batch_size=batch_size,
+    )
+
+    params = jax.device_put(results[0], replicated)
+
+    if train_mask is not None:
+        train_mask = jax.device_put(train_mask, replicated)
+        print(f"Trainable parameters: {gs3_count_trainable_params(jax.device_get(train_mask))} / {n_params}")
+    else:
+        print(f"Trainable parameters: {n_params} / {n_params}")
+
+    avg_energies = list(results[1])
+    avg_uncerts = list(results[2])
+
+    if len(results) >= 4:
+        params_history = list(results[3])
+    else:
+        params_history = []
+
+    step_nums = list(np.arange(len(avg_energies)))
+
+    var_rad = float(MC_options["var"])
+
+    def push_point(fig, step, e, s):
+        e_host = float(jax.device_get(e))
+        s_host = float(jax.device_get(s))
+
+        step_nums.append(step)
+        avg_energies.append(e_host)
+        avg_uncerts.append(s_host)
+
+        steps_arr = np.asarray(step_nums)
+        E_arr = np.asarray(avg_energies)
+        sig_arr = np.asarray(avg_uncerts)
+
+        with fig.batch_update():
+            fig.data[0].x = list(steps_arr)
+            fig.data[0].y = list(E_arr)
+
+            fig.data[1].x = list(steps_arr)
+            fig.data[1].y = list(E_arr + sig_arr)
+
+            fig.data[2].x = list(steps_arr)
+            fig.data[2].y = list(E_arr - sig_arr)
+
+    prev_max_step = step_nums[-1] + 1 if step_nums else 0
+    pbar = trange(steps, desc="", leave=True, ncols=300)
+
+    if not MC_options["chain"]:
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(
+                global_step,
+                damping_init,
+                damping_final,
+                damping_decay,
+            )
+
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                MC_options["pos_initials"],
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            samples = jax.device_put(samples, configs_sharding)
+
+            params, energy, uncert, info = sr_step_shard_masked(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                mesh,
+                example_params=example_params,
+                train_mask=train_mask,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+                sr_dense_stats_sharded_fn=sr_dense_stats_sharded_fn,
+                pytree_to_vec=pytree_to_vec,
+                vec_to_pytree=vec_to_pytree,
+                n_params=n_params,
+            )
+
+            params_history.append(jax.device_get(params))
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | solver = dense-masked | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                step_nums.append(global_step)
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+    else:
+        prev_samples = MC_options["pos_initials"]
+
+        for step_num in pbar:
+            global_step = prev_max_step + step_num
+            damping = damping_schedule(
+                global_step,
+                damping_init,
+                damping_final,
+                damping_decay,
+            )
+
+            params_host = jax.device_get(params)
+
+            samples, accept_rate = sampler.run_many_chains(
+                params_host,
+                MC_options["num_samples"] // MC_options["nchains"],
+                MC_options["thermalization"],
+                MC_options["skip"],
+                var_rad,
+                prev_samples,
+                MC_options["seeds"],
+            )
+
+            accept_rate = float(jnp.mean(accept_rate))
+            var_rad = var_rad * np.exp(adapt_rate * (accept_rate - target_accept))
+            var_rad = float(np.clip(var_rad, 1e-4, 2 * np.pi))
+
+            prev_samples = samples.reshape(
+                (MC_options["nchains"], MC_options["num_samples"] // MC_options["nchains"])
+                + sampler.shape
+            )[:, -1]
+
+            samples = jax.device_put(samples, configs_sharding)
+
+            params, energy, uncert, info = sr_step_shard_masked(
+                model,
+                eta,
+                g,
+                mu,
+                params,
+                samples,
+                lr,
+                mesh,
+                example_params=example_params,
+                train_mask=train_mask,
+                damping=damping,
+                clip_threshold=clip_threshold,
+                batch_size=batch_size,
+                sr_dense_stats_sharded_fn=sr_dense_stats_sharded_fn,
+                pytree_to_vec=pytree_to_vec,
+                vec_to_pytree=vec_to_pytree,
+                n_params=n_params,
+            )
+
+            params_history.append(jax.device_get(params))
+
+            energy_host = float(jax.device_get(energy))
+            uncert_host = float(jax.device_get(uncert))
+
+            pbar.set_description(
+                f"E/N = {energy_host / sampler.shape[0]:.4f} | "
+                f"damping = {damping:.2e} | solver = dense-masked | "
+                f"accept = {accept_rate:.2f} | var = {var_rad:.4f} rad",
+                refresh=True,
+            )
+
+            if fig is not None:
+                push_point(fig, global_step, energy, uncert)
+            else:
+                step_nums.append(global_step)
+                avg_energies.append(energy_host)
+                avg_uncerts.append(uncert_host)
+
+    return params, avg_energies, avg_uncerts, params_history
 
 
 
