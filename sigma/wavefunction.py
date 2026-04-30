@@ -416,6 +416,143 @@ class GodSlayer2(nn.Module):
         return jnp.exp(-out)
 
 
+class GodSlayer2_5(nn.Module):
+    """
+    Same stencil stack as GodSlayer2, but with a separation-resolved readout.
+
+    After the fused stack, compute
+
+        c_r = mean_i mean_c x_{i, i+r, c}
+
+    and then
+
+        out = sum_r sep_weights[r] * c_r
+
+    This keeps translation invariance but does not collapse all separations equally.
+    """
+    num_layers: int = 1
+    num_neighbors: int = 1
+    num_channels: int = 1
+    param_dtype: jnp.dtype = jnp.float32
+    residual_scale: float = 1.0
+    sep_weight_init: str = "mean"   # "mean" or "zero"
+    symmetric_sep_weights: bool = False
+
+    @staticmethod
+    def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
+        return jnp.einsum("...ia,...ja->...ij", n, n)
+
+    @staticmethod
+    def godslayer_laplacian_init(
+        num_layers, num_neighbors,
+        self_val=-0.15, neigh_val=0.04, noise=0.05
+    ):
+        def init(key, shape, dtype=jnp.float32):
+            L, C, K = shape
+            depth = jnp.sqrt(float(num_layers))
+            neigh = jnp.sqrt(float(max(1, num_neighbors)))
+
+            w = jnp.zeros(shape, dtype=dtype)
+            w = w.at[:, :, 0].set(self_val / depth)
+
+            if num_neighbors > 0:
+                w = w.at[:, :, 1:].set(neigh_val / (depth * neigh))
+
+            if noise > 0:
+                w = w + noise * jax.random.normal(key, shape, dtype)
+
+            return w
+
+        return init
+
+    @staticmethod
+    def separation_readout_fast(h: jnp.ndarray) -> jnp.ndarray:
+        """
+        h: (..., L, L, C)
+
+        returns:
+            c: (..., L, C)
+
+        c[..., r, c] = mean_i h[..., i, i+r mod L, c]
+        """
+        L = h.shape[-3]
+        i = jnp.arange(L)
+        r = jnp.arange(L)
+        j = (i[:, None] + r[None, :]) % L
+
+        vals = h[..., i[:, None], j, :]    # (..., L_i, L_r, C)
+        return jnp.mean(vals, axis=-3)     # (..., L_r, C)
+
+    @staticmethod
+    def symmetrize_sep_weights(w: jnp.ndarray) -> jnp.ndarray:
+        """
+        Enforce w[r] = w[-r mod L].
+        """
+        return 0.5 * (w + jnp.roll(w[::-1], 1))
+
+    def setup(self):
+        self.weights = self.param(
+            "weights",
+            self.godslayer_laplacian_init(self.num_layers, self.num_neighbors),
+            (self.num_layers, self.num_channels, self.num_neighbors + 1),
+            self.param_dtype,
+        )
+
+        self._fused_stack = make_godslayer2_fused_stack_nhwc_fast(
+            self.num_neighbors
+        )
+
+    @nn.compact
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        if n.shape[-1] != 3:
+            raise ValueError(f"Expected (..., L, 3), got {n.shape}")
+
+        L = n.shape[-2]
+        dtype = self.param_dtype
+
+        g = self.gram_matrix(n).astype(dtype)
+        g = g * (1.0 - jnp.eye(L, dtype=dtype))
+
+        x0 = jnp.broadcast_to(
+            g[..., :, :, None],
+            g.shape[:-2] + (L, L, self.num_channels),
+        )
+
+        x = self._fused_stack(
+            x0,
+            self.weights,
+            jnp.asarray(self.residual_scale, dtype=dtype),
+        )
+
+        c = self.separation_readout_fast(x)     # (..., L, C)
+
+        def sep_init(key, shape, dtype=jnp.float32):
+            if self.sep_weight_init == "mean":
+                # Starts close to GS2's mean readout.
+                return jnp.ones(shape, dtype=dtype) / shape[0]
+            elif self.sep_weight_init == "zero":
+                return jnp.zeros(shape, dtype=dtype)
+            else:
+                raise ValueError("sep_weight_init must be 'mean' or 'zero'.")
+
+        sep_weights = self.param(
+            "sep_weights",
+            sep_init,
+            (L,),
+            self.param_dtype,
+        )
+
+        if self.symmetric_sep_weights:
+            sep_weights = self.symmetrize_sep_weights(sep_weights)
+
+        # First average over channels, then weighted sum over separations.
+        # c_mean: (..., L)
+        c_mean = jnp.mean(c, axis=-1)
+
+        # out: (...)
+        out = jnp.einsum("...r,r->...", c_mean, sep_weights)
+
+        return jnp.exp(-out)
 
 
 def transfer_learn(
