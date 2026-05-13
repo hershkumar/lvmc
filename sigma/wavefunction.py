@@ -555,6 +555,194 @@ class GodSlayer2_5(nn.Module):
         return jnp.exp(-out)
 
 
+
+class GodSlayer2_5_Fast(nn.Module):
+    """
+    Faster version of GodSlayer2_5.
+
+    Main changes:
+      1. Zeroes Gram diagonal with indexed update instead of multiplying by eye(L).
+      2. Fuses channel mean + separation readout.
+      3. Avoids constructing c = (..., L, C).
+      4. Avoids gathering (..., L, L, C) during readout.
+         Instead gathers from the channel-averaged matrix (..., L, L).
+    """
+    num_layers: int = 1
+    num_neighbors: int = 1
+    num_channels: int = 1
+    param_dtype: jnp.dtype = jnp.float32
+    residual_scale: float = 1.0
+    sep_weight_init: str = "mean"
+    symmetric_sep_weights: bool = False
+
+    @staticmethod
+    def gram_matrix(n: jnp.ndarray) -> jnp.ndarray:
+        # For (..., L, 3), this returns (..., L, L).
+        return jnp.einsum("...ia,...ja->...ij", n, n)
+
+    @staticmethod
+    def zero_diagonal(g: jnp.ndarray) -> jnp.ndarray:
+        """
+        Faster and less memory-hungry than
+
+            g * (1 - eye(L))
+
+        because it avoids constructing/broadcasting a full L x L mask.
+        """
+        L = g.shape[-1]
+        idx = jnp.arange(L)
+        return g.at[..., idx, idx].set(0.0)
+
+    @staticmethod
+    def godslayer_laplacian_init(
+        num_layers,
+        num_neighbors,
+        self_val=-0.15,
+        neigh_val=0.04,
+        noise=0.05,
+    ):
+        def init(key, shape, dtype=jnp.float32):
+            L_depth, C, K = shape
+
+            depth = jnp.sqrt(jnp.asarray(float(num_layers), dtype=dtype))
+            neigh = jnp.sqrt(jnp.asarray(float(max(1, num_neighbors)), dtype=dtype))
+
+            w = jnp.zeros(shape, dtype=dtype)
+            w = w.at[:, :, 0].set(jnp.asarray(self_val, dtype=dtype) / depth)
+
+            if num_neighbors > 0:
+                w = w.at[:, :, 1:].set(
+                    jnp.asarray(neigh_val, dtype=dtype) / (depth * neigh)
+                )
+
+            if noise > 0:
+                w = w + jnp.asarray(noise, dtype=dtype) * jax.random.normal(
+                    key, shape, dtype
+                )
+
+            return w
+
+        return init
+
+    @staticmethod
+    def symmetrize_sep_weights(w: jnp.ndarray) -> jnp.ndarray:
+        """
+        Enforce w[r] = w[-r mod L].
+        """
+        return 0.5 * (w + jnp.roll(w[::-1], 1))
+
+    @staticmethod
+    def weighted_separation_readout_fast(
+        h: jnp.ndarray,
+        sep_weights: jnp.ndarray,
+    ) -> jnp.ndarray:
+        """
+        Computes
+
+            out = sum_r sep_weights[r] * mean_i mean_c h[..., i, i+r, c]
+
+        but avoids explicitly forming
+
+            c[..., r, c] = mean_i h[..., i, i+r, c]
+
+        and avoids gathering the full (..., L, L, C) tensor.
+
+        h shape:
+            (..., L, L, C)
+
+        sep_weights shape:
+            (L,)
+
+        returns:
+            (...,)
+        """
+        L = h.shape[-3]
+
+        # First average over channels.
+        # This reduces readout memory by a factor of C.
+        h_mean = jnp.mean(h, axis=-1)  # (..., L, L)
+
+        i = jnp.arange(L, dtype=jnp.int32)
+        r = jnp.arange(L, dtype=jnp.int32)
+
+        # Flat index for h_mean[..., i, i+r mod L].
+        # idx shape: (L_i, L_r)
+        idx = i[:, None] * L + ((i[:, None] + r[None, :]) % L)
+
+        h_flat = h_mean.reshape(h_mean.shape[:-2] + (L * L,))
+
+        # vals shape: (..., L_i, L_r)
+        vals = jnp.take(h_flat, idx, axis=-1)
+
+        # weighted_i shape: (..., L_i)
+        weighted_i = jnp.einsum("...ir,r->...i", vals, sep_weights)
+
+        # Average over i.
+        return jnp.mean(weighted_i, axis=-1)
+
+    def setup(self):
+        self.weights = self.param(
+            "weights",
+            self.godslayer_laplacian_init(
+                self.num_layers,
+                self.num_neighbors,
+            ),
+            (self.num_layers, self.num_channels, self.num_neighbors + 1),
+            self.param_dtype,
+        )
+
+        self._fused_stack = make_godslayer2_fused_stack_nhwc_fast(
+            self.num_neighbors
+        )
+
+    @nn.compact
+    def __call__(self, n: jnp.ndarray) -> jnp.ndarray:
+        if n.shape[-1] != 3:
+            raise ValueError(f"Expected (..., L, 3), got {n.shape}")
+
+        L = n.shape[-2]
+        dtype = self.param_dtype
+
+        g = self.gram_matrix(n).astype(dtype)
+        g = self.zero_diagonal(g)
+
+        # Broadcast is lazy initially, but the fused stack will eventually
+        # materialize an (..., L, L, C) working array.
+        x0 = jnp.broadcast_to(
+            g[..., :, :, None],
+            g.shape[:-2] + (L, L, self.num_channels),
+        )
+
+        x = self._fused_stack(
+            x0,
+            self.weights,
+            jnp.asarray(self.residual_scale, dtype=dtype),
+        )
+
+        def sep_init(key, shape, dtype=jnp.float32):
+            if self.sep_weight_init == "mean":
+                return jnp.ones(shape, dtype=dtype) / jnp.asarray(shape[0], dtype=dtype)
+            elif self.sep_weight_init == "zero":
+                return jnp.zeros(shape, dtype=dtype)
+            else:
+                raise ValueError("sep_weight_init must be 'mean' or 'zero'.")
+
+        sep_weights = self.param(
+            "sep_weights",
+            sep_init,
+            (L,),
+            self.param_dtype,
+        )
+
+        if self.symmetric_sep_weights:
+            sep_weights = self.symmetrize_sep_weights(sep_weights)
+
+        out = self.weighted_separation_readout_fast(x, sep_weights)
+
+        return jnp.exp(-out)
+
+
+
 def transfer_learn(
     params: Any,
     new_num_layers: int,
@@ -1063,3 +1251,252 @@ def cartesian_to_spherical(vectors: jnp.ndarray) -> jnp.ndarray:
     phi = jnp.arctan2(y, x)
 
     return jnp.stack([theta, phi], axis=-1)
+
+
+
+
+
+#### CNN implementation
+Array = jax.Array
+
+
+def normalize_rotors(x: Array, eps: float = 1e-12) -> Array:
+    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    return x / jnp.maximum(norm, eps)
+
+
+def full_gram_matrix(x: Array) -> Array:
+    """
+    x shape:
+        (..., N, 3)
+
+    returns:
+        (..., N, N)
+    """
+    return jnp.matmul(x, jnp.swapaxes(x, -1, -2))
+
+
+def gram_to_obc_separation_features(
+    G: Array,
+    r_max: int,
+    *,
+    include_mask: bool = True,
+    include_edge_features: bool = True,
+) -> Array:
+    """
+    Vectorized OBC separation features from a full Gram matrix.
+
+    G shape:
+        (..., N, N)
+
+    returns:
+        (..., N, C)
+
+    with
+        X[..., i, r-1] = G[..., i, i+r]
+    for valid OBC pairs i+r < N.
+    """
+    if G.shape[-1] != G.shape[-2]:
+        raise ValueError(f"G must have shape (..., N, N), got {G.shape}")
+
+    N = G.shape[-1]
+    dtype = G.dtype
+
+    if r_max < 1:
+        raise ValueError("r_max must be >= 1")
+    if r_max >= N:
+        raise ValueError(f"Need r_max <= N-1. Got r_max={r_max}, N={N}")
+
+    lead_shape = G.shape[:-2]
+    nlead = len(lead_shape)
+
+    i = jnp.arange(N, dtype=jnp.int32)[:, None]                 # (N, 1)
+    r = jnp.arange(1, r_max + 1, dtype=jnp.int32)[None, :]      # (1, r_max)
+    j = i + r                                                   # (N, r_max)
+
+    valid = j < N
+    j_safe = jnp.where(valid, j, 0)
+
+    # Broadcast gather indices to (..., N, r_max)
+    idx = j_safe.reshape((1,) * nlead + (N, r_max))
+    idx = jnp.broadcast_to(idx, lead_shape + (N, r_max))
+
+    sep = jnp.take_along_axis(G, idx, axis=-1)
+
+    valid_b = valid.reshape((1,) * nlead + (N, r_max))
+    valid_b = jnp.broadcast_to(valid_b, lead_shape + (N, r_max))
+
+    sep = jnp.where(valid_b, sep, jnp.zeros((), dtype=dtype))
+
+    features = [sep]
+
+    if include_mask:
+        features.append(valid_b.astype(dtype))
+
+    if include_edge_features:
+        if N == 1:
+            pos = jnp.zeros((N,), dtype=dtype)
+        else:
+            pos = jnp.arange(N, dtype=dtype) / jnp.asarray(N - 1, dtype=dtype)
+
+        left = pos
+        right = 1.0 - pos
+        center_dist = jnp.abs(2.0 * pos - 1.0)
+
+        edge = jnp.stack([left, right, center_dist], axis=-1)  # (N, 3)
+        edge = edge.reshape((1,) * nlead + (N, 3))
+        edge = jnp.broadcast_to(edge, lead_shape + (N, 3))
+
+        features.append(edge)
+
+    return jnp.concatenate(features, axis=-1)
+
+
+class FastMLP(nn.Module):
+    hidden_dims: Sequence[int]
+    out_dim: int
+    activation: Callable[[Array], Array] = nn.celu
+    use_bias: bool = True
+
+    def setup(self):
+        self.hidden = [
+            nn.Dense(width, use_bias=self.use_bias)
+            for width in self.hidden_dims
+        ]
+        self.out = nn.Dense(self.out_dim, use_bias=self.use_bias)
+
+    def __call__(self, x: Array) -> Array:
+        for layer in self.hidden:
+            x = self.activation(layer(x))
+        return self.out(x)
+
+
+class FastResidualConv1DBlock(nn.Module):
+    channels: int
+    kernel_size: int = 3
+    activation: Callable[[Array], Array] = nn.celu
+    use_layernorm: bool = False
+    residual_scale: float = 1.0
+    use_bias: bool = True
+
+    def setup(self):
+        if self.use_layernorm:
+            self.norm = nn.LayerNorm(axis=-1)
+
+        self.conv1 = nn.Conv(
+            features=self.channels,
+            kernel_size=(self.kernel_size,),
+            padding="SAME",
+            use_bias=self.use_bias,
+        )
+        self.conv2 = nn.Conv(
+            features=self.channels,
+            kernel_size=(self.kernel_size,),
+            padding="SAME",
+            use_bias=self.use_bias,
+        )
+
+    def __call__(self, h: Array) -> Array:
+        x = h
+        if self.use_layernorm:
+            x = self.norm(x)
+
+        x = self.activation(self.conv1(x))
+        x = self.conv2(x)
+
+        return h + self.residual_scale * x
+
+
+class CNN(nn.Module):
+    """
+    Faster OBC Gram-CNN.
+
+    Compatible replacement for your CNN-style ansatz.
+
+    Input:
+        x shape (..., N, 3)
+
+    Output:
+        logpsi if return_log=True
+        psi if return_log=False
+    """
+
+    r_max: int
+
+    channels: int = 64
+    num_layers: int = 2
+    kernel_size: int = 3
+    mlp_hidden_dims: Sequence[int] = (20,)
+
+    output_scale: float = 0.05
+    activation: Callable[[Array], Array] = nn.celu
+
+    include_mask: bool = True
+    include_edge_features: bool = True
+    normalize_input: bool = False
+
+    use_layernorm: bool = False
+    use_bias: bool = True
+
+    reflection_symmetrize: bool = False
+    return_log: bool = False
+
+    def setup(self):
+        self.input_projection = nn.Dense(
+            self.channels,
+            use_bias=self.use_bias,
+        )
+
+        residual_scale = 1.0 / jnp.sqrt(float(max(self.num_layers, 1)))
+
+        self.blocks = [
+            FastResidualConv1DBlock(
+                channels=self.channels,
+                kernel_size=self.kernel_size,
+                activation=self.activation,
+                use_layernorm=self.use_layernorm,
+                residual_scale=residual_scale,
+                use_bias=self.use_bias,
+            )
+            for _ in range(self.num_layers)
+        ]
+
+        self.site_readout = FastMLP(
+            hidden_dims=self.mlp_hidden_dims,
+            out_dim=1,
+            activation=self.activation,
+            use_bias=self.use_bias,
+        )
+
+    def _forward_features(self, features: Array) -> Array:
+        h = self.activation(self.input_projection(features))
+
+        for block in self.blocks:
+            h = block(h)
+
+        site_logits = self.site_readout(h)
+        site_logits = jnp.squeeze(site_logits, axis=-1)
+
+        logpsi = jnp.sum(site_logits, axis=-1)
+        return self.output_scale * logpsi
+
+    def _features_from_gram(self, G: Array) -> Array:
+        return gram_to_obc_separation_features(
+            G,
+            self.r_max,
+            include_mask=self.include_mask,
+            include_edge_features=self.include_edge_features,
+        )
+
+    def __call__(self, x: Array) -> Array:
+        if self.normalize_input:
+            x = normalize_rotors(x)
+
+        # Compute the full Gram matrix once.
+        G = full_gram_matrix(x)
+
+        features = self._features_from_gram(G)
+        
+        logpsi = self._forward_features(features)
+
+        return jnp.exp(jnp.clip(logpsi, -30.0, 30.0))
