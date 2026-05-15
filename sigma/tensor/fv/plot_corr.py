@@ -7,10 +7,18 @@ from pathlib import Path
 # User settings
 # ============================================================
 
-csv_paths = [
-    "100_100_wavefunction_corr (2).csv",
-    # Add more CSVs here:
-    # "another_correlator.csv",
+csv_specs = [
+    {
+        "path": "100_100_wavefunction_corr (2).csv",
+        "r_offset": 0,
+        "label": "wavefunction corr",
+    },
+    # Add more CSVs like this:
+    # {
+    #     "path": "another_correlator.csv",
+    #     "r_offset": 10,
+    #     "label": "another corr",
+    # },
 ]
 
 plot_abs = True          # plot log|C(r)| instead of log C(r)
@@ -51,10 +59,14 @@ def load_correlator_csv(path):
 
 plt.figure(figsize=(8, 5))
 
-for csv_path in csv_paths:
+for spec in csv_specs:
+    csv_path = Path(spec["path"])
+    r_offset = spec.get("r_offset", 0)
+    label = spec.get("label", csv_path.stem)
+
     df = load_correlator_csv(csv_path)
 
-    r = df["r"].to_numpy(dtype=float)
+    r = df["r"].to_numpy(dtype=float) + r_offset
     C = df["C"].to_numpy(dtype=float)
     err = df["err"].to_numpy(dtype=float)
 
@@ -70,7 +82,7 @@ for csv_path in csv_paths:
     r_plot = r[valid]
     y_plot = np.log(y_raw[valid])
 
-    label = Path(csv_path).stem
+    label = f"{label}, offset={r_offset}"
 
     if use_error_bars and np.any(np.isfinite(err[valid])):
         # Error propagation:
@@ -95,9 +107,9 @@ for csv_path in csv_paths:
             label=label,
         )
 
-plt.xlabel(r"separation $r$")
+plt.xlabel(r"offset separation $r + r_0$")
 plt.ylabel(ylabel)
-plt.title("Log correlator vs separation")
+plt.title("Log correlator vs offset separation")
 plt.grid(True, alpha=0.3)
 plt.legend()
 plt.tight_layout()
