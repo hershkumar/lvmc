@@ -1500,3 +1500,1064 @@ class CNN(nn.Module):
         logpsi = self._forward_features(features)
 
         return jnp.exp(jnp.clip(logpsi, -30.0, 30.0))
+
+
+
+
+##### CNN_OPT
+
+Array = jax.Array
+
+def normalize_rotors(x: Array, eps: float = 1e-12) -> Array:
+    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    return x / jnp.maximum(norm, eps)
+
+def extract_obc_separation_features(
+    x: Array,
+    r_max: int,
+    *,
+    include_mask: bool = True,
+    include_edge_features: bool = True,
+) -> Array:
+    """
+    Directly extracts OBC separation features in O(N * r_max) time.
+    Bypasses the memory-heavy O(N^2) full Gram matrix calculation entirely.
+    """
+    N = x.shape[-2]
+    dtype = x.dtype
+    lead_shape = x.shape[:-2]
+
+    if r_max < 1:
+        raise ValueError("r_max must be >= 1")
+    if r_max >= N:
+        raise ValueError(f"Need r_max <= N-1. Got r_max={r_max}, N={N}")
+
+    # 1. Efficient Shifted Dot-Products
+    seps = []
+    for r in range(1, r_max + 1):
+        # Dot product of x[i] and x[i+r]
+        # x_base: (..., 0:N-r, 3), x_shifted: (..., r:N, 3)
+        dot = jnp.sum(x[..., :-r, :] * x[..., r:, :], axis=-1)
+        
+        # Pad with r zeros at the end to maintain sequence length N
+        pad_width = [(0, 0)] * len(lead_shape) + [(0, r)]
+        dot_padded = jnp.pad(dot, pad_width)
+        seps.append(dot_padded)
+
+    # Shape: (..., N, r_max)
+    sep = jnp.stack(seps, axis=-1)
+    features = [sep]
+
+    # 2. Mask Generation
+    if include_mask:
+        # The mask corresponds exactly to the unpadded valid indices (i + r < N)
+        i = jnp.arange(N, dtype=jnp.int32)[:, None]
+        r_vec = jnp.arange(1, r_max + 1, dtype=jnp.int32)[None, :]
+        mask = (i + r_vec < N).astype(dtype)
+        
+        mask_b = jnp.broadcast_to(mask, lead_shape + (N, r_max))
+        features.append(mask_b)
+
+    # 3. Edge Features 
+    if include_edge_features:
+        if N == 1:
+            pos = jnp.zeros((N,), dtype=dtype)
+        else:
+            pos = jnp.linspace(0.0, 1.0, N, dtype=dtype)
+
+        left = pos
+        right = 1.0 - pos
+        center_dist = jnp.abs(2.0 * pos - 1.0)
+
+        edge = jnp.stack([left, right, center_dist], axis=-1)  # (N, 3)
+        edge_b = jnp.broadcast_to(edge, lead_shape + (N, 3))
+        features.append(edge_b)
+
+    return jnp.concatenate(features, axis=-1)
+
+
+class FastMLP(nn.Module):
+    hidden_dims: Sequence[int]
+    out_dim: int
+    activation: Callable[[Array], Array] = nn.celu
+    use_bias: bool = True
+
+    @nn.compact
+    def __call__(self, x: Array) -> Array:
+        for width in self.hidden_dims:
+            x = nn.Dense(width, use_bias=self.use_bias)(x)
+            x = self.activation(x)
+        return nn.Dense(self.out_dim, use_bias=self.use_bias)(x)
+
+
+class FastResidualConv1DBlock(nn.Module):
+    channels: int
+    kernel_size: int = 3
+    activation: Callable[[Array], Array] = nn.celu
+    use_layernorm: bool = False
+    residual_scale: float = 1.0
+    use_bias: bool = True
+
+    @nn.compact
+    def __call__(self, h: Array) -> Array:
+        x = h
+        if self.use_layernorm:
+            x = nn.LayerNorm(axis=-1)(x)
+
+        x = nn.Conv(
+            features=self.channels, 
+            kernel_size=(self.kernel_size,), 
+            padding="SAME", 
+            use_bias=self.use_bias
+        )(x)
+        x = self.activation(x)
+        
+        x = nn.Conv(
+            features=self.channels, 
+            kernel_size=(self.kernel_size,), 
+            padding="SAME", 
+            use_bias=self.use_bias
+        )(x)
+
+        return h + self.residual_scale * x
+
+
+class CNN(nn.Module):
+    """
+    Faster OBC Gram-CNN.
+    """
+    r_max: int
+    channels: int = 64
+    num_layers: int = 2
+    kernel_size: int = 3
+    mlp_hidden_dims: Sequence[int] = (20,)
+    output_scale: float = 0.05
+    activation: Callable[[Array], Array] = nn.celu
+    
+    include_mask: bool = True
+    include_edge_features: bool = True
+    normalize_input: bool = False
+    use_layernorm: bool = False
+    use_bias: bool = True
+    reflection_symmetrize: bool = False
+    return_log: bool = False
+
+    def setup(self):
+        self.input_projection = nn.Dense(self.channels, use_bias=self.use_bias)
+        residual_scale = 1.0 / jnp.sqrt(float(max(self.num_layers, 1)))
+
+        self.blocks = [
+            FastResidualConv1DBlock(
+                channels=self.channels,
+                kernel_size=self.kernel_size,
+                activation=self.activation,
+                use_layernorm=self.use_layernorm,
+                residual_scale=residual_scale,
+                use_bias=self.use_bias,
+            )
+            for _ in range(self.num_layers)
+        ]
+
+        self.site_readout = FastMLP(
+            hidden_dims=self.mlp_hidden_dims,
+            out_dim=1,
+            activation=self.activation,
+            use_bias=self.use_bias,
+        )
+
+    def _forward_features(self, features: Array) -> Array:
+        h = self.activation(self.input_projection(features))
+
+        for block in self.blocks:
+            h = block(h)
+
+        site_logits = self.site_readout(h)
+        site_logits = jnp.squeeze(site_logits, axis=-1)
+
+        logpsi = jnp.sum(site_logits, axis=-1)
+        return self.output_scale * logpsi
+
+    def __call__(self, x: Array) -> Array:
+        if self.normalize_input:
+            x = normalize_rotors(x)
+
+        # Replaced the O(N^2) Gram matrix with O(N*r_max) feature extractor
+        features = extract_obc_separation_features(
+            x,
+            self.r_max,
+            include_mask=self.include_mask,
+            include_edge_features=self.include_edge_features,
+        )
+        
+        logpsi = self._forward_features(features)
+
+        # BUG FIX: Actually adhere to the return_log flag!
+        if self.return_log:
+            return logpsi
+            
+        return jnp.exp(jnp.clip(logpsi, -30.0, 30.0))
+
+
+
+
+
+##### GS4
+
+# ============================================================
+# Basic utilities
+# ============================================================
+
+def normalize_rotors(x: Array, eps: float = 1e-12) -> Array:
+    norm = jnp.linalg.norm(x, axis=-1, keepdims=True)
+    return x / jnp.maximum(norm, eps)
+
+
+def gram_matrix(n: Array) -> Array:
+    """
+    n:
+        (..., L, 3)
+
+    returns:
+        (..., L, L), G_ij = n_i · n_j
+    """
+    return jnp.einsum("...ia,...ja->...ij", n, n)
+
+
+def zero_diagonal_matrix(g: Array) -> Array:
+    """
+    g:
+        (..., L, L)
+
+    returns:
+        g with g[..., i, i] = 0
+    """
+    L = g.shape[-1]
+    idx = jnp.arange(L)
+    return g.at[..., idx, idx].set(0.0)
+
+
+def zero_diagonal_tensor(h: Array) -> Array:
+    """
+    h:
+        (..., L, L, C)
+
+    returns:
+        h with h[..., i, i, :] = 0
+    """
+    L = h.shape[-3]
+    idx = jnp.arange(L)
+    return h.at[..., idx, idx, :].set(0.0)
+
+
+def _celu(x: Array, alpha: float = 1.0) -> Array:
+    xa = x / alpha
+    neg = alpha * jnp.expm1(jnp.minimum(xa, 0.0))
+    return jnp.maximum(x, 0.0) + neg
+
+
+def _celu_prime(x: Array, alpha: float = 1.0) -> Array:
+    xa = x / alpha
+    return jnp.where(x > 0.0, 1.0, jnp.exp(jnp.minimum(xa, 0.0)))
+
+
+# ============================================================
+# PBC raw separation features
+# ============================================================
+
+def extract_pbc_raw_separation_features(
+    n: Array,
+    r_max: int,
+    *,
+    reflection_mode: str = "none",
+) -> Array:
+    """
+    Direct PBC analogue of the optimized CNN feature extractor.
+
+    n:
+        (..., L, 3)
+
+    returns:
+        (..., L, F)
+
+    For reflection_mode="none":
+
+        F = r_max
+        X[..., i, r-1] = n_i · n_{i+r mod L}
+
+    For reflection_mode="average":
+
+        F = r_max
+        X[..., i, r-1] =
+            0.5 * [n_i · n_{i+r} + n_i · n_{i-r}]
+
+    For reflection_mode="both":
+
+        F = 2 * r_max
+        includes both forward and backward separations as separate channels.
+    """
+    if n.shape[-1] != 3:
+        raise ValueError(f"Expected n shape (..., L, 3), got {n.shape}")
+
+    L = n.shape[-2]
+
+    if r_max < 0:
+        raise ValueError("r_max must be >= 0")
+    if r_max == 0:
+        return jnp.zeros(n.shape[:-1] + (0,), dtype=n.dtype)
+    if r_max >= L:
+        raise ValueError(f"Need r_max <= L-1 for PBC. Got r_max={r_max}, L={L}.")
+
+    if reflection_mode not in {"none", "average", "both"}:
+        raise ValueError("reflection_mode must be one of {'none', 'average', 'both'}.")
+
+    feats = []
+
+    for r in range(1, r_max + 1):
+        n_fwd = jnp.roll(n, shift=-r, axis=-2)
+        dot_fwd = jnp.sum(n * n_fwd, axis=-1)
+
+        if reflection_mode == "none":
+            feats.append(dot_fwd)
+
+        else:
+            n_bwd = jnp.roll(n, shift=+r, axis=-2)
+            dot_bwd = jnp.sum(n * n_bwd, axis=-1)
+
+            if reflection_mode == "average":
+                feats.append(0.5 * (dot_fwd + dot_bwd))
+            elif reflection_mode == "both":
+                feats.append(dot_fwd)
+                feats.append(dot_bwd)
+
+    return jnp.stack(feats, axis=-1)
+
+
+# ============================================================
+# GodSlayer 2D PBC stencil stack
+# ============================================================
+
+def _depthwise_pbc_stencil_apply(
+    x: Array,
+    w: Array,
+    num_neighbors: int,
+) -> Array:
+    """
+    PBC depthwise row/column stencil.
+
+    x:
+        (..., L, L, C)
+
+    w:
+        (C, num_neighbors + 1)
+
+    returns:
+        (..., L, L, C)
+    """
+    y = x * w[:, 0]
+
+    for d in range(1, num_neighbors + 1):
+        wd = w[:, d]
+
+        nbr = (
+            jnp.roll(x, shift=+d, axis=-3) +
+            jnp.roll(x, shift=-d, axis=-3) +
+            jnp.roll(x, shift=+d, axis=-2) +
+            jnp.roll(x, shift=-d, axis=-2)
+        )
+
+        y = y + nbr * wd
+
+    return y
+
+# ============================================================
+# SR-safe GodSlayer 2D PBC stencil stack
+# ============================================================
+
+def make_depthwise_godslayer_layer(num_neighbors: int):
+    """
+    SR-safe version.
+
+    No custom_vjp. This is required because SR commonly uses jvp/linearize
+    through the model, and JAX cannot apply forward-mode autodiff to a
+    custom_vjp function.
+    """
+
+    def layer(x: Array, w: Array, residual_scale: Array) -> Array:
+        y = _depthwise_pbc_stencil_apply(x, w, num_neighbors)
+        return x + residual_scale * _celu(y)
+
+    return layer
+
+
+def make_fused_godslayer_cnn_stack(
+    num_neighbors: int,
+    *,
+    symmetrize_each_layer: bool = True,
+    zero_diagonal_each_layer: bool = True,
+):
+    """
+    SR-safe fused GodSlayer stack.
+
+    Each layer does:
+
+        x <- x + residual_scale * CELU(depthwise_PBC_stencil(x))
+        x <- x + mix_scale      * CELU(pointwise_channel_mix(x))
+
+    This version is fully autodiff-compatible for Adam, reverse-mode grad,
+    and SR/JVP-based Fisher matvecs.
+    """
+    depthwise_layer = make_depthwise_godslayer_layer(num_neighbors)
+
+    def fused_stack(
+        x0: Array,
+        depthwise_weights: Array,
+        mix_weights: Array,
+        mix_bias: Array,
+        residual_scale: Array,
+        mix_scale: Array,
+    ) -> Array:
+        def body(x, inputs):
+            wd, wm, bm = inputs
+
+            # Depthwise GodSlayer stencil update.
+            x = depthwise_layer(x, wd, residual_scale)
+
+            # Pointwise channel mixing.
+            z = jnp.einsum("...c,cd->...d", x, wm) + bm
+            x = x + mix_scale * _celu(z)
+
+            if symmetrize_each_layer:
+                x = 0.5 * (x + jnp.swapaxes(x, -3, -2))
+
+            if zero_diagonal_each_layer:
+                x = zero_diagonal_tensor(x)
+
+            return x, None
+
+        x_final, _ = lax.scan(
+            body,
+            x0,
+            (depthwise_weights, mix_weights, mix_bias),
+        )
+
+        return x_final
+
+    return fused_stack
+
+
+# ============================================================
+# Extract PBC site/separation bands from evolved Gram tensor
+# ============================================================
+def extract_pbc_matrix_band_features(
+    h: Array,
+    r_max: int,
+    *,
+    reflection_mode: str = "none",
+) -> Array:
+    """
+    h:
+        (L, L, C) or (..., L, L, C)
+
+    returns:
+        (L, F) or (..., L, F)
+    """
+    if h.ndim < 3:
+        raise ValueError(f"Expected h shape (L, L, C) or (..., L, L, C), got {h.shape}")
+
+    L = h.shape[-3]
+
+    if h.shape[-2] != L:
+        raise ValueError(f"Expected square matrix axes in h, got {h.shape}")
+
+    if r_max < 0:
+        raise ValueError("r_max must be >= 0")
+
+    if r_max == 0:
+        return jnp.zeros(h.shape[:-3] + (L, 0), dtype=h.dtype)
+
+    if r_max >= L:
+        raise ValueError(f"Need r_max <= L-1 for PBC. Got r_max={r_max}, L={L}.")
+
+    if reflection_mode not in {"none", "average", "both"}:
+        raise ValueError("reflection_mode must be one of {'none', 'average', 'both'}.")
+
+    i = jnp.arange(L, dtype=jnp.int32)
+    bands = []
+
+    for r in range(1, r_max + 1):
+        jp = (i + r) % L
+        vals_fwd = h[..., i, jp, :]  # (L, C) or (..., L, C)
+
+        if reflection_mode == "none":
+            bands.append(vals_fwd)
+
+        else:
+            jm = (i - r) % L
+            vals_bwd = h[..., i, jm, :]
+
+            if reflection_mode == "average":
+                bands.append(0.5 * (vals_fwd + vals_bwd))
+            elif reflection_mode == "both":
+                bands.append(vals_fwd)
+                bands.append(vals_bwd)
+
+    return jnp.concatenate(bands, axis=-1)
+
+
+def broadcast_global_separation_features(
+    h: Array,
+    r_max: int,
+    *,
+    reflection_mode: str = "average",
+) -> Array:
+    """
+    Optional global separation summary.
+
+    h:
+        (..., L, L, C)
+
+    returns:
+        (..., L, F)
+
+    It computes separation-band means over sites and broadcasts them back to
+    every site. This gives the site-CNN access to global separation statistics
+    without breaking translation invariance.
+    """
+    site_feats = extract_pbc_matrix_band_features(
+        h,
+        r_max,
+        reflection_mode=reflection_mode,
+    )  # (..., L, F)
+
+    global_feats = jnp.mean(site_feats, axis=-2, keepdims=True)  # (..., 1, F)
+    return jnp.broadcast_to(global_feats, site_feats.shape)
+
+
+# ============================================================
+# Circular Conv1D site readout
+# ============================================================
+
+class FastMLP(nn.Module):
+    hidden_dims: Sequence[int]
+    out_dim: int
+    activation: Callable[[Array], Array] = nn.celu
+    use_bias: bool = True
+    param_dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, x: Array) -> Array:
+        for width in self.hidden_dims:
+            x = nn.Dense(
+                width,
+                use_bias=self.use_bias,
+                param_dtype=self.param_dtype,
+            )(x)
+            x = self.activation(x)
+
+        return nn.Dense(
+            self.out_dim,
+            use_bias=self.use_bias,
+            param_dtype=self.param_dtype,
+        )(x)
+
+
+def circular_pad_1d(x: Array, radius: int) -> Array:
+    """
+    Circularly pads the site axis.
+
+    x:
+        (..., L, C)
+
+    returns:
+        (..., L + 2 * radius, C)
+    """
+    if radius == 0:
+        return x
+
+    pad_width = [(0, 0)] * x.ndim
+    pad_width[-2] = (radius, radius)
+    return jnp.pad(x, pad_width, mode="wrap")
+
+
+class CircularResidualConv1DBlock(nn.Module):
+    channels: int
+    kernel_size: int = 3
+    activation: Callable[[Array], Array] = nn.celu
+    use_layernorm: bool = False
+    residual_scale: float = 1.0
+    use_bias: bool = True
+    param_dtype: jnp.dtype = jnp.float32
+
+    @nn.compact
+    def __call__(self, h: Array) -> Array:
+        if self.kernel_size < 1:
+            raise ValueError("kernel_size must be >= 1")
+        if self.kernel_size % 2 != 1:
+            raise ValueError("Use odd kernel_size for circular SAME padding.")
+
+        radius = self.kernel_size // 2
+
+        x = h
+
+        if self.use_layernorm:
+            x = nn.LayerNorm(axis=-1)(x)
+
+        x = circular_pad_1d(x, radius)
+        x = nn.Conv(
+            features=self.channels,
+            kernel_size=(self.kernel_size,),
+            padding="VALID",
+            use_bias=self.use_bias,
+            param_dtype=self.param_dtype,
+        )(x)
+        x = self.activation(x)
+
+        x = circular_pad_1d(x, radius)
+        x = nn.Conv(
+            features=self.channels,
+            kernel_size=(self.kernel_size,),
+            padding="VALID",
+            use_bias=self.use_bias,
+            param_dtype=self.param_dtype,
+        )(x)
+
+        return h + self.residual_scale * x
+
+
+class PBCCNNReadout(nn.Module):
+    channels: int = 64
+    num_layers: int = 2
+    kernel_size: int = 3
+    mlp_hidden_dims: Sequence[int] = (32,)
+
+    output_scale: float = 0.05
+    activation: Callable[[Array], Array] = nn.celu
+
+    use_layernorm: bool = False
+    use_bias: bool = True
+    param_dtype: jnp.dtype = jnp.float32
+
+    readout: str = "sum"
+    return_log: bool = False
+    clip_log: float = 30.0
+
+    @nn.compact
+    def __call__(self, features: Array) -> Array:
+        if features.ndim < 2:
+            raise ValueError(
+                f"Expected features shape (L, F) or (..., L, F), got {features.shape}"
+            )
+
+        if self.readout not in {"sum", "mean"}:
+            raise ValueError("readout must be 'sum' or 'mean'.")
+
+        h = nn.Dense(
+            self.channels,
+            use_bias=self.use_bias,
+            param_dtype=self.param_dtype,
+        )(features)
+        h = self.activation(h)
+
+        residual_scale = 1.0 / jnp.sqrt(jnp.asarray(max(self.num_layers, 1), h.dtype))
+
+        for _ in range(self.num_layers):
+            h = CircularResidualConv1DBlock(
+                channels=self.channels,
+                kernel_size=self.kernel_size,
+                activation=self.activation,
+                use_layernorm=self.use_layernorm,
+                residual_scale=residual_scale,
+                use_bias=self.use_bias,
+                param_dtype=self.param_dtype,
+            )(h)
+
+        site_logits = FastMLP(
+            hidden_dims=self.mlp_hidden_dims,
+            out_dim=1,
+            activation=self.activation,
+            use_bias=self.use_bias,
+            param_dtype=self.param_dtype,
+        )(h)
+
+        site_logits = jnp.squeeze(site_logits, axis=-1)
+
+        if self.readout == "sum":
+            logpsi = jnp.sum(site_logits, axis=-1)
+        else:
+            logpsi = jnp.mean(site_logits, axis=-1)
+
+        logpsi = self.output_scale * logpsi
+
+        if self.return_log:
+            return logpsi
+
+        return jnp.exp(jnp.clip(logpsi, -self.clip_log, self.clip_log))
+# ============================================================
+# Initializers
+# ============================================================
+
+def godslayer_laplacian_init(
+    num_layers: int,
+    num_neighbors: int,
+    *,
+    self_val: float = -0.15,
+    neigh_val: float = 0.04,
+    noise: float = 0.02,
+):
+    """
+    Initializes the depthwise 2D Gram stencil close to a weak Laplacian-like
+    local smoothing/diffusion operator.
+    """
+    def init(key, shape, dtype=jnp.float32):
+        # shape = (num_layers, channels, num_neighbors + 1)
+        _, _, _ = shape
+
+        depth = jnp.sqrt(jnp.asarray(float(max(num_layers, 1)), dtype=dtype))
+        neigh = jnp.sqrt(jnp.asarray(float(max(num_neighbors, 1)), dtype=dtype))
+
+        w = jnp.zeros(shape, dtype=dtype)
+
+        w = w.at[:, :, 0].set(jnp.asarray(self_val, dtype=dtype) / depth)
+
+        if num_neighbors > 0:
+            w = w.at[:, :, 1:].set(
+                jnp.asarray(neigh_val, dtype=dtype) / (depth * neigh)
+            )
+
+        if noise > 0:
+            w = w + jnp.asarray(noise, dtype=dtype) * jax.random.normal(
+                key,
+                shape,
+                dtype,
+            )
+
+        return w
+
+    return init
+
+
+def small_channel_mix_init(scale: float = 0.02):
+    """
+    Small near-identity channel mixer.
+
+    The residual form is:
+
+        x <- x + mix_scale * CELU(x @ W + b)
+
+    so W can safely start small.
+    """
+    def init(key, shape, dtype=jnp.float32):
+        return jnp.asarray(scale, dtype=dtype) * jax.random.normal(
+            key,
+            shape,
+            dtype,
+        )
+
+    return init
+
+
+def input_gain_init(noise: float = 0.02):
+    def init(key, shape, dtype=jnp.float32):
+        return jnp.ones(shape, dtype=dtype) + jnp.asarray(noise, dtype=dtype) * jax.random.normal(
+            key,
+            shape,
+            dtype,
+        )
+    return init
+
+
+# ============================================================
+# Full ansatz
+# ============================================================
+
+class GodSlayer4(nn.Module):
+    """
+    Optimized PBC GodSlayer-CNN ansatz.
+
+    This is meant to be the "full" production model.
+
+    It combines:
+
+      - raw PBC shifted dot-product features:
+            n_i · n_{i+r}
+
+      - full-Gram GodSlayer 2D stencil processing:
+            h_ijc <- stencil/mix residual stack
+
+      - site/separation extraction:
+            h_i,i+r,c
+
+      - circular Conv1D site processing:
+            h_i -> CNN(h)_i
+
+      - extensive invariant readout:
+            logpsi = output_scale * sum_i site_logit_i
+
+    Hyperparameter guidance:
+
+      For speed:
+          raw_r_max   = 8 to 20
+          stack_r_max = 8 to 20
+          stack_channels = 4 to 16
+          cnn_channels = 32 to 128
+
+      For maximal finite-L expressivity:
+          raw_r_max   = L - 1
+          stack_r_max = L - 1
+
+    reflection_mode:
+        "none":
+            keeps oriented positive separations only.
+
+        "average":
+            enforces reflection/parity symmetry by averaging +r and -r.
+            Good default for ground states.
+
+        "both":
+            includes both directions separately.
+            Use if you want translation invariance but not forced reflection symmetry.
+    """
+
+    # Raw direct PBC separation features.
+    raw_r_max: int = 10
+    use_raw_features: bool = True
+
+    # GodSlayer full-Gram stack.
+    stack_r_max: int = 10
+    stack_layers: int = 2
+    stack_neighbors: int = 1
+    stack_channels: int = 8
+    stack_residual_scale: float = 1.0
+    stack_mix_scale: float = 0.5
+
+    # Feature options.
+    use_stack_features: bool = True
+    use_global_stack_features: bool = False
+    reflection_mode: str = "average"
+
+    # Site CNN readout.
+    cnn_channels: int = 64
+    cnn_layers: int = 2
+    cnn_kernel_size: int = 3
+    mlp_hidden_dims: Sequence[int] = (32,)
+
+    # Output.
+    output_scale: float = 0.05
+    readout: str = "sum"       # "sum" for extensive logpsi, "mean" for size-normalized logpsi
+    return_log: bool = False
+    clip_log: float = 30.0
+
+    # Numerics.
+    activation: Callable[[Array], Array] = nn.celu
+    param_dtype: jnp.dtype = jnp.float32
+    normalize_input: bool = False
+    use_layernorm: bool = False
+    use_bias: bool = True
+
+    # GodSlayer stack controls.
+    symmetrize_each_layer: bool = True
+    zero_diagonal_each_layer: bool = True
+
+    # Initializer scales.
+    laplacian_self_val: float = -0.15
+    laplacian_neigh_val: float = 0.04
+    laplacian_noise: float = 0.02
+    input_gain_noise: float = 0.02
+    channel_mix_init_scale: float = 0.02
+
+    def setup(self):
+        if not self.use_raw_features and not self.use_stack_features:
+            raise ValueError("At least one of use_raw_features/use_stack_features must be True.")
+
+        if self.reflection_mode not in {"none", "average", "both"}:
+            raise ValueError("reflection_mode must be one of {'none', 'average', 'both'}.")
+
+        if self.stack_layers < 0:
+            raise ValueError("stack_layers must be >= 0")
+
+        if self.stack_channels < 1:
+            raise ValueError("stack_channels must be >= 1")
+
+        self.input_gain = self.param(
+            "input_gain",
+            input_gain_init(self.input_gain_noise),
+            (self.stack_channels,),
+            self.param_dtype,
+        )
+
+        self.input_bias = self.param(
+            "input_bias",
+            nn.initializers.zeros,
+            (self.stack_channels,),
+            self.param_dtype,
+        )
+
+        self.depthwise_weights = self.param(
+            "depthwise_weights",
+            godslayer_laplacian_init(
+                self.stack_layers,
+                self.stack_neighbors,
+                self_val=self.laplacian_self_val,
+                neigh_val=self.laplacian_neigh_val,
+                noise=self.laplacian_noise,
+            ),
+            (self.stack_layers, self.stack_channels, self.stack_neighbors + 1),
+            self.param_dtype,
+        )
+
+        self.mix_weights = self.param(
+            "mix_weights",
+            small_channel_mix_init(self.channel_mix_init_scale),
+            (self.stack_layers, self.stack_channels, self.stack_channels),
+            self.param_dtype,
+        )
+
+        self.mix_bias = self.param(
+            "mix_bias",
+            nn.initializers.zeros,
+            (self.stack_layers, self.stack_channels),
+            self.param_dtype,
+        )
+
+        self._fused_stack = make_fused_godslayer_cnn_stack(
+            self.stack_neighbors,
+            symmetrize_each_layer=self.symmetrize_each_layer,
+            zero_diagonal_each_layer=self.zero_diagonal_each_layer,
+        )
+
+        self.readout_module = PBCCNNReadout(
+            channels=self.cnn_channels,
+            num_layers=self.cnn_layers,
+            kernel_size=self.cnn_kernel_size,
+            mlp_hidden_dims=self.mlp_hidden_dims,
+            output_scale=self.output_scale,
+            activation=self.activation,
+            use_layernorm=self.use_layernorm,
+            use_bias=self.use_bias,
+            param_dtype=self.param_dtype,
+            readout=self.readout,
+            return_log=self.return_log,
+            clip_log=self.clip_log,
+        )
+
+    def _initial_gram_channels(self, n: Array) -> Array:
+        """
+        Builds initial h_ijc from G_ij using a learnable scalar-to-channel
+        projection:
+
+            h_ijc = G_ij * gain_c + bias_c
+
+        Then zeros the diagonal.
+        """
+        dtype = self.param_dtype
+
+        g = gram_matrix(n).astype(dtype)
+        g = zero_diagonal_matrix(g)
+
+        h = g[..., :, :, None] * self.input_gain + self.input_bias
+        h = zero_diagonal_tensor(h)
+
+        return h
+
+    def _run_stack(self, h0: Array) -> Array:
+        if self.stack_layers == 0:
+            return h0
+
+        return self._fused_stack(
+            h0,
+            self.depthwise_weights,
+            self.mix_weights,
+            self.mix_bias,
+            jnp.asarray(self.stack_residual_scale, dtype=self.param_dtype),
+            jnp.asarray(self.stack_mix_scale, dtype=self.param_dtype),
+        )
+
+    def _make_site_features(self, n: Array, h: Array) -> Array:
+        features = []
+
+        if self.use_raw_features:
+            raw = extract_pbc_raw_separation_features(
+                n.astype(self.param_dtype),
+                self.raw_r_max,
+                reflection_mode=self.reflection_mode,
+            )
+            features.append(raw)
+
+        if self.use_stack_features:
+            stack_feats = extract_pbc_matrix_band_features(
+                h,
+                self.stack_r_max,
+                reflection_mode=self.reflection_mode,
+            )
+            features.append(stack_feats)
+
+        if self.use_global_stack_features:
+            global_feats = broadcast_global_separation_features(
+                h,
+                self.stack_r_max,
+                reflection_mode=self.reflection_mode,
+            )
+            features.append(global_feats)
+
+        return jnp.concatenate(features, axis=-1)
+
+    def __call__(self, n: Array) -> Array:
+        if n.shape[-1] != 3:
+            raise ValueError(f"Expected input shape (..., L, 3), got {n.shape}")
+
+        if self.normalize_input:
+            n = normalize_rotors(n)
+
+        L = n.shape[-2]
+
+        if self.raw_r_max >= L:
+            raise ValueError(f"Need raw_r_max <= L-1. Got raw_r_max={self.raw_r_max}, L={L}.")
+
+        if self.stack_r_max >= L:
+            raise ValueError(f"Need stack_r_max <= L-1. Got stack_r_max={self.stack_r_max}, L={L}.")
+
+        h0 = self._initial_gram_channels(n)
+        h = self._run_stack(h0)
+
+        site_features = self._make_site_features(n, h)
+
+        return self.readout_module(site_features)
+
+
+# ============================================================
+# Optional excited-state wrapper
+# ============================================================
+
+class GodSlayer4Excited(GodSlayer4):
+    """
+    Excited-state variant of GodSlayer4.
+
+    psi_excited(n) = O(n) * psi_even(n)
+
+    Default:
+        O(n) = sum_i n_i^z
+    """
+
+    excited_component: int = 2
+    excited_staggered: bool = False
+
+    @nn.compact
+    def __call__(self, n: Array) -> Array:
+        if self.return_log:
+            raise ValueError(
+                "GodSlayer4Excited should use return_log=False because "
+                "O(n) * psi(n) is signed."
+            )
+
+        psi_even = super().__call__(n)
+
+        comp = n[..., self.excited_component]
+
+        if self.excited_staggered:
+            L = n.shape[-2]
+            signs = (-1.0) ** jnp.arange(L, dtype=n.dtype)
+            Oz = jnp.sum(signs * comp, axis=-1)
+        else:
+            Oz = jnp.sum(comp, axis=-1)
+
+        return Oz * psi_even
